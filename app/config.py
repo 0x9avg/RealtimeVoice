@@ -50,6 +50,14 @@ class Settings(BaseModel):
     reconnect_backoff_initial_s: float = 2.0
     reconnect_backoff_max_s: float = 30.0
 
+    # Video-wall control agent (see app/wall/ — a local, Linux-runnable port
+    # of ../../humanoid-robot/apps/wall-agent's `sim` driver). Point this at
+    # a real wall-agent (--driver pipe, on the wall's Windows PC) in
+    # production; the tool's HTTP contract does not change.
+    wall_agent_url: str = os.environ.get("WALL_AGENT_URL", "http://localhost:8093")
+    wall_agent_token: str = os.environ.get("WALL_AGENT_TOKEN", "")
+    wall_agent_timeout_s: float = 5.0
+
     def resolved_api_key(self) -> str:
         return os.environ.get(self.api_key_env, "")
 

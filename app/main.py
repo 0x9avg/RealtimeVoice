@@ -27,7 +27,7 @@ from app.gemini_live import (
     Transcript,
     TurnComplete,
 )
-from app.tools import GetCurrentTimeTool, ToolRegistry
+from app.tools import ControlVideoWallTool, GetCurrentTimeTool, ToolRegistry
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 _LOG = logging.getLogger("prototype")
@@ -40,6 +40,13 @@ app = FastAPI(title="RealtimeVoice prototype")
 def build_tool_registry() -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(GetCurrentTimeTool(default_timezone=settings.default_timezone))
+    registry.register(
+        ControlVideoWallTool(
+            base_url=settings.wall_agent_url,
+            token=settings.wall_agent_token,
+            timeout_s=settings.wall_agent_timeout_s,
+        )
+    )
     return registry
 
 
