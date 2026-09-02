@@ -10,7 +10,16 @@ dependencies = [
     "pydantic>=2.7",
     "python-dotenv>=1.0",
     "httpx>=0.27",
+    # audioop (app/robot_audio.py's resampling) is stdlib on 3.12, removed in
+    # 3.13+. The robot runs 3.12; this shim only matters for dev machines on
+    # newer Python (this one is 3.14).
+    "audioop-lts>=0.2; python_version >= '3.13'",
 ]
+
+# unitree_sdk2py is not on PyPI; it's built on the robot from the vendor's
+# git repo (see README.md's "Запуск на роботе"). Not listed as a dependency
+# here — app/robot_audio.py imports it lazily so the rest of this package
+# stays installable everywhere else.
 
 [build-system]
 requires = ["hatchling"]

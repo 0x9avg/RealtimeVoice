@@ -93,6 +93,11 @@
 
     <div class="controls">
         <span>Статус: <span id="status">idle</span></span>
+        <label for="mic-source">Микрофон:</label>
+        <select id="mic-source">
+            <option value="browser">браузера</option>
+            <option value="robot" id="mic-source-robot-option">встроенный (робот)</option>
+        </select>
         <button id="mic-toggle" type="button">Start mic</button>
         <button id="mute" type="button">Замолчи</button>
     </div>

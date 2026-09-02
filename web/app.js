@@ -10,6 +10,8 @@ const statusEl = document.getElementById('status');
 const transcriptEl = document.getElementById('transcript');
 const toolLogEl = document.getElementById('tool-log');
 const micButton = document.getElementById('mic-toggle');
+const micSourceSelect = document.getElementById('mic-source');
+const micSourceRobotOption = document.getElementById('mic-source-robot-option');
 const muteButton = document.getElementById('mute');
 const textForm = document.getElementById('text-form');
 const textInput = document.getElementById('text-input');
@@ -25,6 +27,11 @@ let micActive = false;
 
 function setStatus(text) {
   statusEl.textContent = text;
+}
+
+function listeningStatusLabel() {
+  if (!micActive) return 'idle';
+  return micSourceSelect.value === 'robot' ? 'listening (robot mic)' : 'listening';
 }
 
 function appendLine(container, className, text) {
@@ -90,8 +97,22 @@ function playChunk(arrayBuffer) {
 }
 
 // -- capture: mic -> server -------------------------------------------------
+//
+// Two interchangeable sources feed the same session, picked by the
+// mic-source dropdown: "browser" captures locally via getUserMedia and
+// streams PCM16 over the WS (as before); "robot" sends no audio from the
+// page at all — it just tells the backend to start forwarding the robot's
+// own head-mic multicast (see app/main.py's `mic_source`). Either way the
+// Start-mic button is the single control; sendMicSource() is what actually
+// arms/disarms audio flowing into the Gemini session on the backend.
 
-async function startMic() {
+function sendMicSource(source) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'mic_source', source }));
+  }
+}
+
+async function startBrowserMic() {
   micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
   captureCtx = new AudioContext({ sampleRate: 16000 });
   await captureCtx.audioWorklet.addModule('/capture-worklet.js');
@@ -103,19 +124,34 @@ async function startMic() {
     }
   };
   source.connect(captureNode);
-  micActive = true;
-  micButton.textContent = 'Stop mic';
-  setStatus('listening');
 }
 
-function stopMic() {
-  micActive = false;
+function stopBrowserMic() {
   if (captureNode) captureNode.port.onmessage = null;
   if (micStream) micStream.getTracks().forEach((track) => track.stop());
   if (captureCtx) captureCtx.close();
   captureCtx = null;
   captureNode = null;
   micStream = null;
+}
+
+async function startMic() {
+  const source = micSourceSelect.value;
+  if (source === 'browser') {
+    await startBrowserMic();
+  }
+  sendMicSource(source);
+  micActive = true;
+  micSourceSelect.disabled = true;
+  micButton.textContent = 'Stop mic';
+  setStatus(source === 'robot' ? 'listening (robot mic)' : 'listening');
+}
+
+function stopMic() {
+  micActive = false;
+  stopBrowserMic();
+  sendMicSource('none');
+  micSourceSelect.disabled = false;
   micButton.textContent = 'Start mic';
   setStatus('idle');
 }
@@ -134,16 +170,22 @@ function connectSocket() {
     }
     const message = JSON.parse(event.data);
     switch (message.type) {
+      case 'capabilities':
+        micSourceRobotOption.disabled = !message.robot_mic;
+        if (!message.robot_mic && micSourceSelect.value === 'robot') {
+          micSourceSelect.value = 'browser';
+        }
+        break;
       case 'status':
         setStatus(message.state);
         if (message.detail) appendToolLog(`[status] ${message.state}: ${message.detail}`);
         break;
       case 'turn_complete':
-        setStatus(micActive ? 'listening' : 'idle');
+        setStatus(listeningStatusLabel());
         break;
       case 'interrupted':
         stopPlayback();
-        setStatus(micActive ? 'listening' : 'idle');
+        setStatus(listeningStatusLabel());
         break;
       case 'transcript':
         appendTranscript(message.role, message.text);
@@ -153,6 +195,11 @@ function connectSocket() {
         break;
       case 'tool_result':
         appendToolLog(`← ${message.name}: ${message.text}`);
+        break;
+      case 'robot_audio':
+        // AUDIO_OUTPUT=robot: audio plays through the real robot speaker,
+        // not this page — this just confirms a chunk was sent there.
+        setStatus('speaking (robot)');
         break;
       default:
         break;
