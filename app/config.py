@@ -9,12 +9,16 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+from app.scenarios import build_system_instruction
+
+_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(_ROOT / ".env")
 
 _DEFAULT_WS_HOST = "generativelanguage.googleapis.com"
 # Confirmed working against the customer's key in ../../humanoid-robot on
@@ -30,27 +34,32 @@ _DEFAULT_EMBEDDING_MODEL = "models/gemini-embedding-001"
 
 
 class Settings(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    # validate_default=True: robot_profile below is a Literal fed from an
+    # env var, not a passed-in kwarg — pydantic v2 skips validating field
+    # *defaults* unless asked to, so without this a typo'd ROBOT_PROFILE
+    # would silently pass through instead of failing fast at startup.
+    model_config = ConfigDict(frozen=True, extra="forbid", validate_default=True)
+
+    # "r1" (presenter) or "g1" (security-desk guard) — one shared codebase,
+    # different tool set/knowledge/system-instruction per profile (see
+    # app/tool_registry.py, app/scenarios.py). Settings is a module-level
+    # singleton read once at import time, so switching profiles means
+    # restarting the process with a different ROBOT_PROFILE — there is no
+    # runtime hot-swap, by design (this is a test bench, not a fleet).
+    robot_profile: Literal["r1", "g1"] = os.environ.get("ROBOT_PROFILE", "r1")  # type: ignore[assignment]
 
     ws_host: str = _DEFAULT_WS_HOST
     api_key_env: str = "GEMINI_API_KEY"
     model: str = os.environ.get("GEMINI_LIVE_MODEL", _DEFAULT_MODEL)
     voice_name: str = os.environ.get("GEMINI_LIVE_VOICE", _DEFAULT_VOICE)
     # BCP-47 code that PINS the spoken language. Empty (default) lets the
-    # model answer in whatever language it was addressed in.
+    # model answer in whatever language it was addressed in. Left empty on
+    # purpose even though we restrict languages — speechConfig.languageCode
+    # does not reliably constrain native-audio Live models' output language
+    # (confirmed against Google's docs and a live google/adk-python issue);
+    # the RU/KZ-only rule lives in system_instruction instead (see
+    # app/scenarios.py's _LANGUAGE_RULE).
     language_code: str = ""
-    system_instruction: str = (
-        "You are a helpful voice assistant running in a developer prototype. "
-        "Speak naturally and concisely. When asked for the current time or "
-        "date, always call the get_current_time tool instead of guessing — "
-        "you have no reliable sense of the current date on your own. For any "
-        "question that could be answered by the venue's own uploaded "
-        "documents (facts, numbers, names, procedures — anything specific to "
-        "this place), call search_knowledge first and answer only from what "
-        "it returns. If it finds nothing relevant, say so honestly and offer "
-        "to check with a person — never invent facts search_knowledge did "
-        "not give you."
-    )
     send_sample_rate_hz: int = 16_000  # what the browser sends TO Gemini
     receive_sample_rate_hz: int = 24_000  # what Gemini sends back
     default_timezone: str = _DEFAULT_TIMEZONE
@@ -110,13 +119,33 @@ class Settings(BaseModel):
     # ../CLAUDE.md's Structured Facts Store vs. RAG distinction) — for facts
     # that must never be wrong, a typed lookup is still the right answer;
     # this is for prose/explanatory material.
-    knowledge_dir: str = os.environ.get(
-        "KNOWLEDGE_DIR", str(Path(__file__).resolve().parent.parent / "knowledge")
-    )
     knowledge_embedding_model: str = os.environ.get(
         "GEMINI_EMBEDDING_MODEL", _DEFAULT_EMBEDDING_MODEL
     )
     knowledge_top_k: int = int(os.environ.get("KNOWLEDGE_TOP_K", "3"))
+
+    # G1 profile only: guard_kb.py's room/FAQ reference data, and the
+    # append-only JSONL log of completed visit cards (app/g1_tools.py's
+    # VisitJournal). Harmless if unused on the r1 profile.
+    guard_kb_path: str = os.environ.get("GUARD_KB_PATH", str(_ROOT / "config" / "guard-kb.yaml"))
+    visit_journal_path: str = os.environ.get(
+        "VISIT_JOURNAL_PATH", str(_ROOT / "data" / "visits.jsonl")
+    )
+
+    @property
+    def system_instruction(self) -> str:
+        """Profile-specific instruction (see app/scenarios.py) — not a plain
+        field because it depends on robot_profile, which is fixed at
+        startup but known only once Settings() has actually run."""
+        return build_system_instruction(self.robot_profile)
+
+    @property
+    def knowledge_dir(self) -> str:
+        """RAG source directory (app/knowledge.py) — r1 keeps the original
+        default; g1 gets its own directory. KNOWLEDGE_DIR still overrides
+        either, e.g. to point a given profile at custom content."""
+        default_name = "knowledge" if self.robot_profile == "r1" else "knowledge_guard"
+        return os.environ.get("KNOWLEDGE_DIR", str(_ROOT / default_name))
 
     def resolved_api_key(self) -> str:
         return os.environ.get(self.api_key_env, "")

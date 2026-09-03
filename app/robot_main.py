@@ -28,28 +28,12 @@ from app.gemini_live import (
     Transcript,
     TurnComplete,
 )
-from app.knowledge import knowledge_base
+from app.g1_tools import log_relay_divergence
 from app.robot_audio import HalfDuplexGate, RobotMic, RobotSpeaker
-from app.tools import ControlVideoWallTool, GetCurrentTimeTool, SearchKnowledgeTool, ToolRegistry
+from app.tool_registry import build_tool_registry
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 _LOG = logging.getLogger("robot")
-
-
-def build_tool_registry() -> ToolRegistry:
-    registry = ToolRegistry()
-    registry.register(GetCurrentTimeTool(default_timezone=settings.default_timezone))
-    registry.register(
-        ControlVideoWallTool(
-            base_url=settings.wall_agent_url,
-            token=settings.wall_agent_token,
-            timeout_s=settings.wall_agent_timeout_s,
-        )
-    )
-    registry.register(
-        SearchKnowledgeTool(knowledge=knowledge_base, top_k=settings.knowledge_top_k)
-    )
-    return registry
 
 
 async def main() -> None:
@@ -58,7 +42,7 @@ async def main() -> None:
         _LOG.error("no Gemini API key set: export %s", settings.api_key_env)
         return
 
-    tools = build_tool_registry()
+    tools = build_tool_registry(settings)
     adapter = GeminiLiveAdapter(settings=settings, tools=tools)
     mic = RobotMic(
         multicast_group=settings.robot_mic_multicast_group,
@@ -71,6 +55,11 @@ async def main() -> None:
         volume_pct=settings.robot_speaker_volume_pct,
     )
     gate = HalfDuplexGate(guard_s=settings.robot_post_speech_guard_ms / 1000.0)
+    # See app/main.py's identical bookkeeping for why this accumulates
+    # fragments instead of comparing the first Transcript(role="model") chunk.
+    last_tool_name: str | None = None
+    last_tool_text = ""
+    model_turn_fragments: list[str] = []
 
     async def mic_task() -> None:
         async for pcm in mic.stream():
@@ -79,6 +68,7 @@ async def main() -> None:
             await adapter.send_audio(pcm)
 
     async def gemini_task() -> None:
+        nonlocal last_tool_name, last_tool_text, model_turn_fragments
         async for event in adapter.events():
             match event:
                 case AudioChunk(pcm=pcm):
@@ -86,23 +76,38 @@ async def main() -> None:
                     await speaker.play(pcm, sample_rate_hz=settings.receive_sample_rate_hz)
                 case TurnComplete():
                     gate.on_speaking_stopped()
+                    # See RobotSpeaker.stop's docstring — closing the vendor
+                    # stream after every turn (not just on barge-in) avoids
+                    # the second+ utterance going silently mute.
+                    await speaker.stop()
+                    if last_tool_name is not None and model_turn_fragments:
+                        log_relay_divergence(
+                            last_tool_name, last_tool_text, "".join(model_turn_fragments)
+                        )
+                    last_tool_name, last_tool_text, model_turn_fragments = None, "", []
                     _LOG.info("turn complete")
                 case Interrupted():
                     gate.on_speaking_stopped()
                     await speaker.stop()
+                    last_tool_name, last_tool_text, model_turn_fragments = None, "", []
                     _LOG.info("interrupted — barge-in")
                 case ConnectionStateChanged(state=state, detail=detail):
                     _LOG.info("status=%s %s", state, detail)
                 case Transcript(role=role, text=text):
+                    if role == "model":
+                        model_turn_fragments.append(text)
                     _LOG.info("[%s] %s", role, text)
                 case ToolCall() as call:
                     _LOG.info("tool_call name=%s args=%s", call.name, call.args)
                     result = await tools.dispatch(call.name, call.args)
                     await call.respond(result.text)
+                    last_tool_name, last_tool_text, model_turn_fragments = call.name, result.text, []
                     _LOG.info("tool_result name=%s ok=%s text=%s", call.name, result.ok, result.text)
 
     _LOG.info(
-        "starting — mic %s:%d via %s, speaker via %s, wall agent %s",
+        "starting — profile=%s tools=%s, mic %s:%d via %s, speaker via %s, wall agent %s",
+        settings.robot_profile,
+        tools.names(),
         settings.robot_mic_multicast_group,
         settings.robot_mic_multicast_port,
         settings.robot_mic_interface_ip,

@@ -206,7 +206,15 @@ class RobotSpeaker:
         """Resample to 16kHz mono, chunk to 50ms, pace and send."""
         converted = self._resample(pcm, sample_rate_hz)
         async with self._lock:
-            client = self._ensure_client()
+            # Off-loop, like PlayStream/PlayStop below: ChannelFactoryInitialize
+            # + AudioClient.Init() are blocking DDS/vendor-SDK calls (Init()
+            # has a 10s SetTimeout) — calling them inline on the first play()
+            # of a session freezes the whole event loop, including this
+            # session's own WS receive loop, for however long DDS discovery
+            # takes. That reads as "the browser session hung then closed"
+            # with no server-side error, since nothing raised — it just never
+            # got to run anything else while blocked.
+            client = await asyncio.to_thread(self._ensure_client)
             now = time.monotonic()
             if self._next_send_monotonic <= now:
                 self._next_send_monotonic = now - _LEAD_S
@@ -238,7 +246,16 @@ class RobotSpeaker:
         return converted
 
     async def stop(self) -> None:
-        """Interrupt current playback (barge-in) — clears the vendor buffer."""
+        """Close out the current playback stream — call this both on
+        barge-in (Interrupted) AND after a normal TurnComplete, not just
+        interruption. The vendor audio service was observed going silent
+        (PlayStream still returns code 0, no exception, just no sound) on
+        the second+ utterance of a session — reusing the same stream_id
+        without an intervening PlayStop appears to leave the vendor-side
+        stream in a state where it silently drops further chunks. Rotating
+        _stream_id here (not just clearing playback state) forces the next
+        play() to start what the vendor sees as a brand-new stream.
+        """
         async with self._lock:
             self._resample_state = None
             self._resample_src_rate = 0
@@ -251,6 +268,7 @@ class RobotSpeaker:
                 code = stop_result[0] if isinstance(stop_result, tuple) else stop_result
                 if code:
                     _LOG.warning("PlayStop non-zero result: %r", stop_result)
+            self._stream_id = str(int(time.time() * 1000))
             self._next_send_monotonic = time.monotonic()
 
     async def _pace_wait_for_next_slot(self) -> None:

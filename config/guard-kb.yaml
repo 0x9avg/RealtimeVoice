@@ -1,0 +1,27 @@
+# Guard-desk reference data (app/guard_kb.py). Placeholder test-bench
+# content — swap in the customer's actual room directory/FAQ/info when
+# available. Same field shape as ../../humanoid-robot's guard-kb.yaml, for
+# portability if real data ever needs to move between the two.
+
+rooms:
+  - room: "305"
+    floor: "третий этаж"
+    unit: "Отдел кадров"
+    note: "рядом с лифтом"
+  - room: "101"
+    floor: "первый этаж"
+    unit: "Приёмная"
+    note: "рядом с центральным входом"
+
+faq:
+  - q: "режим работы"
+    a: "Учреждение работает с 9:00 до 18:30, обеденный перерыв с 13:00 до 14:30."
+  - q: "часы приёма граждан"
+    a: "Приём граждан — по будням с 10:00 до 17:00."
+  - q: "какие документы нужны для визита"
+    a: "При себе необходимо иметь удостоверение личности; при наличии — предварительно оформленный пропуск."
+
+info: |
+  Это тестовые данные для стенда, не согласованные с заказчиком. При отсутствии
+  ответа в справочнике — сообщите об этом честно и предложите обратиться к
+  сотруднику охраны.

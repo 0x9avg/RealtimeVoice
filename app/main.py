@@ -27,9 +27,9 @@ from app.gemini_live import (
     Transcript,
     TurnComplete,
 )
-from app.knowledge import knowledge_base
+from app.g1_tools import log_relay_divergence
 from app.robot_audio import HalfDuplexGate, RobotMic, RobotSpeaker
-from app.tools import ControlVideoWallTool, GetCurrentTimeTool, SearchKnowledgeTool, ToolRegistry
+from app.tool_registry import build_tool_registry
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 _LOG = logging.getLogger("prototype")
@@ -37,22 +37,6 @@ _LOG = logging.getLogger("prototype")
 _WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
 app = FastAPI(title="RealtimeVoice prototype")
-
-
-def build_tool_registry() -> ToolRegistry:
-    registry = ToolRegistry()
-    registry.register(GetCurrentTimeTool(default_timezone=settings.default_timezone))
-    registry.register(
-        ControlVideoWallTool(
-            base_url=settings.wall_agent_url,
-            token=settings.wall_agent_token,
-            timeout_s=settings.wall_agent_timeout_s,
-        )
-    )
-    registry.register(
-        SearchKnowledgeTool(knowledge=knowledge_base, top_k=settings.knowledge_top_k)
-    )
-    return registry
 
 
 @app.websocket("/ws/session")
@@ -71,7 +55,8 @@ async def session(ws: WebSocket) -> None:
         await ws.close()
         return
 
-    tools = build_tool_registry()
+    tools = build_tool_registry(settings)
+    _LOG.info("session.start profile=%s tools=%s", settings.robot_profile, tools.names())
     adapter = GeminiLiveAdapter(settings=settings, tools=tools)
     await ws.send_json(
         {
@@ -115,6 +100,13 @@ async def session(ws: WebSocket) -> None:
     # start, so one page can offer both "Микрофон браузера" and "Встроенный
     # микрофон робота" with a single working Start-mic button either way.
     mic_source = "none"
+    # For app/g1_tools.py's log_relay_divergence: what the last relay-
+    # sensitive tool call returned, and the model's spoken text accumulated
+    # since then (outputAudioTranscription can arrive in fragments — compare
+    # the joined turn, not a partial piece, at TurnComplete).
+    last_tool_name: str | None = None
+    last_tool_text = ""
+    model_turn_fragments: list[str] = []
 
     async def robot_mic_task() -> None:
         assert mic is not None  # noqa: S101 — only created/started together
@@ -130,6 +122,7 @@ async def session(ws: WebSocket) -> None:
         while True:
             message = await ws.receive()
             if message.get("type") == "websocket.disconnect":
+                _LOG.info("browser.disconnect code=%s", message.get("code"))
                 return
             data = message.get("bytes")
             if data is not None:
@@ -152,6 +145,7 @@ async def session(ws: WebSocket) -> None:
                     _LOG.info("mic_source -> %s", mic_source)
 
     async def forward_from_gemini() -> None:
+        nonlocal last_tool_name, last_tool_text, model_turn_fragments
         async for event in adapter.events():
             match event:
                 case AudioChunk(pcm=pcm):
@@ -163,18 +157,35 @@ async def session(ws: WebSocket) -> None:
                     else:
                         await ws.send_bytes(pcm)
                 case ConnectionStateChanged(state=state, detail=detail):
+                    log_fn = _LOG.warning if state == "closed" else _LOG.info
+                    log_fn("gemini.connection_state state=%s detail=%s", state, detail)
                     await ws.send_json({"type": "status", "state": state, "detail": detail})
                 case TurnComplete():
                     if gate is not None:
                         gate.on_speaking_stopped()
+                    if speaker is not None:
+                        # Close out the vendor stream cleanly (see
+                        # RobotSpeaker.stop's docstring) — without this the
+                        # second+ utterance of a session can go silently
+                        # mute on the real robot speaker.
+                        await speaker.stop()
+                    if last_tool_name is not None and model_turn_fragments:
+                        log_relay_divergence(
+                            last_tool_name, last_tool_text, "".join(model_turn_fragments)
+                        )
+                    last_tool_name, last_tool_text, model_turn_fragments = None, "", []
                     await ws.send_json({"type": "turn_complete"})
                 case Interrupted():
                     if gate is not None:
                         gate.on_speaking_stopped()
                     if speaker is not None:
                         await speaker.stop()
+                    # Barge-in cut the turn short — not a relay divergence.
+                    last_tool_name, last_tool_text, model_turn_fragments = None, "", []
                     await ws.send_json({"type": "interrupted"})
                 case Transcript(role=role, text=text):
+                    if role == "model":
+                        model_turn_fragments.append(text)
                     await ws.send_json({"type": "transcript", "role": role, "text": text})
                 case ToolCall() as call:
                     _LOG.info("tool_call name=%s args=%s", call.name, call.args)
@@ -183,6 +194,7 @@ async def session(ws: WebSocket) -> None:
                     )
                     result = await tools.dispatch(call.name, call.args)
                     await call.respond(result.text)
+                    last_tool_name, last_tool_text, model_turn_fragments = call.name, result.text, []
                     await ws.send_json(
                         {
                             "type": "tool_result",
@@ -203,7 +215,7 @@ async def session(ws: WebSocket) -> None:
         for task in done:
             exc = task.exception()
             if exc is not None:
-                _LOG.warning("session.task_ended: %s", exc)
+                _LOG.warning("session.task_ended name=%s", task.get_name(), exc_info=exc)
     finally:
         for task in tasks:
             task.cancel()

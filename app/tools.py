@@ -48,6 +48,9 @@ class ToolRegistry:
     def register(self, tool: Tool) -> None:
         self._tools[tool.name] = tool
 
+    def names(self) -> list[str]:
+        return list(self._tools)
+
     def function_declarations(self) -> list[dict[str, Any]]:
         return [
             {"name": tool.name, "description": tool.description, "parameters": tool.parameters}
