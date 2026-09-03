@@ -8,7 +8,7 @@ reference implementation in the sibling `humanoid-robot` repo:
 live_gemini/client.py`, already proven against a real customer key. This
 module strips out everything specific to the robot (ALSA audio devices, the
 platform event bus, gestures, cross-session memory) and keeps only what a
-browser-driven prototype needs, plus two things that version doesn't use:
+browser-driven service needs, plus two things that version doesn't use:
 text-turn input (`clientContent`) and input/output transcription.
 """
 
@@ -18,6 +18,7 @@ import asyncio
 import base64
 import contextlib
 import json
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
@@ -164,11 +165,23 @@ class GeminiLiveAdapter:
     async def events(self) -> AsyncIterator[LiveEvent]:
         """Connect, stay connected with exponential backoff, yield events.
 
+        Also proactively swaps to a fresh Gemini session once the current
+        one has been open past `settings.max_session_duration_s` — see that
+        setting's docstring for why (Gemini itself eventually kills a
+        long-lived session with a 1008, and per-turn latency creeps up
+        beforehand). The swap only happens right after a TurnComplete, never
+        mid-turn, so it's never audible as a cut-off response — from the
+        caller's point of view it looks exactly like the ordinary
+        "connecting" -> "connected" cycle already used for real
+        disconnects, just without the backoff delay (this one isn't an
+        error, so there's nothing to back off from).
+
         Stops iterating once `close()` has been called.
         """
         backoff = self.settings.reconnect_backoff_initial_s
         while not self._closed:
             yield ConnectionStateChanged(state="connecting")
+            proactive_refresh = False
             try:
                 async with websockets.connect(
                     self._ws_url(), open_timeout=self.settings.open_timeout_s
@@ -177,16 +190,43 @@ class GeminiLiveAdapter:
                     backoff = self.settings.reconnect_backoff_initial_s
                     await ws.send(json.dumps(self._build_setup_message()))
                     yield ConnectionStateChanged(state="connected")
+                    session_opened = time.monotonic()
                     async for event in self._pump(ws):
                         yield event
+                        if (
+                            isinstance(event, TurnComplete)
+                            and time.monotonic() - session_opened
+                            >= self.settings.max_session_duration_s
+                        ):
+                            proactive_refresh = True
+                            break
             except asyncio.CancelledError:
                 raise
-            except (websockets.exceptions.ConnectionClosed, OSError, TimeoutError) as exc:
+            except Exception as exc:  # noqa: BLE001 — deliberately broad, see below
+                # Anything from here down is a "the connection attempt or an
+                # in-flight message failed" case, not just the couple of
+                # exception types this used to name explicitly
+                # (ConnectionClosed/OSError/TimeoutError). websockets.connect
+                # can also raise InvalidHandshake/InvalidStatusCode/
+                # InvalidURI (bad API key, quota rejection, a proxy/DNS
+                # hiccup with an unusual error type) — none of those are
+                # ConnectionClosed subclasses, so the narrower catch used to
+                # let them escape uncaught and permanently kill this
+                # generator (and, one level up, the whole session — see
+                # app/session_hub.py's SessionHub._pump_gemini for the
+                # matching fix on the consumer side). Every one of these is
+                # something a reconnect-with-backoff can plausibly recover
+                # from (a bad key won't fix itself, but retrying costs
+                # nothing and the alternative is silently going mute for
+                # the rest of the process's life).
                 yield ConnectionStateChanged(state="closed", detail=str(exc))
             finally:
                 self._ws = None
             if self._closed:
                 break
+            if proactive_refresh:
+                yield ConnectionStateChanged(state="closed", detail="proactive session refresh")
+                continue
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, self.settings.reconnect_backoff_max_s)
 

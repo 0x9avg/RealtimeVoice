@@ -3,7 +3,7 @@
 Same route shape as `../../humanoid-robot/apps/wall-agent` (`POST
 /wall/command`, `GET /wall/state`, `GET /healthz`, optional `X-Wall-Token`),
 built on FastAPI instead of that repo's stdlib `http.server` — this
-prototype already depends on FastAPI for the voice bridge, so reusing it
+project already depends on FastAPI for the voice bridge, so reusing it
 here avoids a second HTTP stack for no benefit (that repo's choice of stdlib
 was about a dependency-free Windows install, which doesn't apply to this
 Linux dev simulator).

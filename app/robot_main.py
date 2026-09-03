@@ -3,7 +3,7 @@
 No browser, no FastAPI — this pumps the head mic's multicast stream straight
 into `GeminiLiveAdapter` and plays its audio back through the real speaker
 (see app/robot_audio.py). Everything else (tools, adapter, Gemini protocol)
-is exactly what app/main.py already uses for the browser prototype.
+is exactly what app/main.py already uses for the browser-based session.
 
 Half-duplex by necessity: this hardware has no acoustic echo cancellation,
 so mic frames are dropped while the robot is speaking, and for
@@ -28,8 +28,11 @@ from app.gemini_live import (
     Transcript,
     TurnComplete,
 )
+from app.camera_hub import camera_hub, sampled
 from app.g1_tools import log_relay_divergence
+from app.presence import PresenceRunner
 from app.robot_audio import HalfDuplexGate, RobotMic, RobotSpeaker
+from app.scenarios import PRESENCE_MARKER
 from app.tool_registry import build_tool_registry
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -66,6 +69,24 @@ async def main() -> None:
             if gate.mic_muted:
                 continue
             await adapter.send_audio(pcm)
+
+    async def presence_task() -> None:
+        """Greets a visitor once they appear (R1 ТЗ §4.1 / G1 ТЗ §3.1) — see
+        app/presence.py and app/scenarios.py's PRESENCE_MARKER. Samples the
+        shared app/camera_hub.py singleton rather than polling the DDS
+        VideoClient a second time on its own."""
+
+        async def on_visitor_detected() -> None:
+            _LOG.info("presence.visitor_detected")
+            await adapter.send_text(PRESENCE_MARKER)
+
+        runner = PresenceRunner(
+            frames=sampled(camera_hub, fps=settings.presence_fps),
+            on_visitor_detected=on_visitor_detected,
+            threshold=settings.presence_threshold,
+            rearm_s=settings.presence_rearm_s,
+        )
+        await runner.run()
 
     async def gemini_task() -> None:
         nonlocal last_tool_name, last_tool_text, model_turn_fragments
@@ -115,6 +136,8 @@ async def main() -> None:
         settings.wall_agent_url,
     )
     tasks = [asyncio.create_task(mic_task(), name="mic"), asyncio.create_task(gemini_task(), name="gemini")]
+    if settings.presence_enabled:
+        tasks.append(asyncio.create_task(presence_task(), name="presence"))
     try:
         await asyncio.gather(*tasks)
     finally:

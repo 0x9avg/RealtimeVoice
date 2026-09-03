@@ -1,15 +1,15 @@
 import { useState } from "react";
 import { Mic, MicOff, VolumeX } from "lucide-react";
 
+import { CameraView } from "../components/CameraView";
 import { cn } from "../lib/cn";
 import { useVoiceSession } from "../lib/useVoiceSession";
 
 // NEW component — not a port. humanoid-robot's HomePage.tsx is built around
 // a camera feed, an e-stop toggle and battery telemetry (none of which this
-// prototype has) and streams chat over a NATS-bus/session_id model this
-// backend doesn't implement. This is the same chat/mic/mute/text feature
-// set already working in ../../web/app.js, just as a React page — see
-// useVoiceSession.ts for the ported protocol logic.
+// project has) and streams chat over a NATS-bus/session_id model this
+// backend doesn't implement. The chat/mic/mute/text logic lives in
+// useVoiceSession.ts, which talks directly to /ws/session.
 export function HomePage() {
   const {
     status,
@@ -34,6 +34,8 @@ export function HomePage() {
           {status}
         </span>
       </div>
+
+      <CameraView />
 
       <div className="flex flex-wrap items-center gap-2">
         <select

@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { getAuthToken, notifyUnauthorized } from "../api/client";
+
 // NEW — not ported from humanoid-robot. That dashboard's chat
 // (useConversation.ts + eventStream.tsx) streams answers over a NATS-style
 // event bus keyed by session_id, driven by a separate camera feed and
-// battery telemetry this prototype has none of. This hook is a React
-// rewrite of this prototype's own already-working protocol client
-// (../../web/app.js, kept side by side until this build replaces it) —
-// same /ws/session WS protocol, same audio capture/playback approach.
+// battery telemetry this project has none of. This hook owns the
+// /ws/session WS protocol directly — audio capture/playback, control
+// messages, transcript/tool-log state — for app/main.py's shared session.
 
 export interface TranscriptLine {
   role: "user" | "model";
@@ -97,7 +98,16 @@ export function useVoiceSession() {
 
   useEffect(() => {
     const protocol = location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(`${protocol}://${location.host}/ws/session`);
+    // ?token=... — see app/main.py's /ws/session: a WS handshake can't carry
+    // an Authorization header from browser JS, so this is the only way to
+    // pass the same bearer token the REST calls send. Empty/no token is
+    // fine when the server has no ACCESS_TOKEN configured (app/auth.py's
+    // rule applies here too).
+    const token = getAuthToken();
+    const wsUrl = `${protocol}://${location.host}/ws/session${
+      token ? `?token=${encodeURIComponent(token)}` : ""
+    }`;
+    const ws = new WebSocket(wsUrl);
     ws.binaryType = "arraybuffer";
     wsRef.current = ws;
 
@@ -113,6 +123,18 @@ export function useVoiceSession() {
           if (!message.robot_mic && micSourceRef.current === "robot") {
             micSourceRef.current = "browser";
             setMicSourceState("browser");
+          }
+          // The robot mic is a GLOBAL switch (app/robot_mic_state.py on the
+          // server) — a previous tab/operator may have already turned it
+          // on, and this fresh connection must reflect that instead of
+          // showing "off" and requiring a redundant Start click. Nothing to
+          // capture locally for this case (the server reads the robot's own
+          // hardware mic), so just mirror the UI state.
+          if (message.robot_mic && message.robot_mic_active) {
+            micSourceRef.current = "robot";
+            setMicSourceState("robot");
+            setMicActive(true);
+            setStatus("listening (robot mic)");
           }
           break;
         case "status":
@@ -142,7 +164,13 @@ export function useVoiceSession() {
           break;
       }
     };
-    ws.onclose = () => setStatus("closed");
+    ws.onclose = (event) => {
+      setStatus("closed");
+      // 4401 — app/main.py's /ws/session rejected a missing/wrong token.
+      // Reuse the exact same "show the token prompt" flow a REST 401
+      // triggers, instead of just going silently dark.
+      if (event.code === 4401) notifyUnauthorized();
+    };
     ws.onerror = () => setStatus("error");
 
     return () => {
@@ -202,7 +230,17 @@ export function useVoiceSession() {
   }, []);
 
   const mute = useCallback(() => {
+    // Local stop first, for an instant cut of whatever's already buffered
+    // in this tab — but on its own this only clears past chunks. The rest
+    // of the current turn is still in flight from the server (and, in
+    // AUDIO_OUTPUT=robot mode, playing on hardware the browser can't touch
+    // at all), so the server also needs telling to stop forwarding/playing
+    // it — see app/main.py's "mute" message handling.
     stopPlayback();
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "mute" }));
+    }
     setStatus(micActive ? "listening" : "idle");
   }, [stopPlayback, micActive]);
 

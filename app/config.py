@@ -1,4 +1,4 @@
-"""Settings for the RealtimeVoice prototype.
+"""Settings for the RealtimeVoice service.
 
 Mirrors the shape of `humanoid-robot`'s `GeminiLiveConfig`: the API key never
 lives in code, only the env var name does. `.env` is loaded once, at import
@@ -57,7 +57,7 @@ class Settings(BaseModel):
     # purpose even though we restrict languages — speechConfig.languageCode
     # does not reliably constrain native-audio Live models' output language
     # (confirmed against Google's docs and a live google/adk-python issue);
-    # the RU/KZ-only rule lives in system_instruction instead (see
+    # the RU/KZ/EN-only rule lives in system_instruction instead (see
     # app/scenarios.py's _LANGUAGE_RULE).
     language_code: str = ""
     send_sample_rate_hz: int = 16_000  # what the browser sends TO Gemini
@@ -67,6 +67,20 @@ class Settings(BaseModel):
     open_timeout_s: float = 10.0
     reconnect_backoff_initial_s: float = 2.0
     reconnect_backoff_max_s: float = 30.0
+    # Gemini Live itself closes a long-lived BidiGenerateContent session with
+    # a 1008 "policy violation" once it's been open too long / accumulated
+    # too much context — observed live on this project at ~9m22s into one
+    # continuous session with several tool calls. Two costs of hitting that
+    # instead of refreshing first: (1) the hard cutoff itself loses the
+    # in-flight turn, and (2) per-turn latency creeps up as the same
+    # session's context keeps growing right up until then. Proactively
+    # reconnecting BETWEEN turns before that point (see
+    # GeminiLiveAdapter.events()) avoids both — conversational memory is
+    # already not preserved across a reconnect either way (no session-
+    # resumption token is used), so a clean scheduled swap costs nothing
+    # extra. Conservative default, well under the observed failure point;
+    # tune via env if real-world session lengths say otherwise.
+    max_session_duration_s: float = float(os.environ.get("MAX_SESSION_DURATION_S", "360"))
 
     # Video-wall control agent (see app/wall/ — a local, Linux-runnable port
     # of ../../humanoid-robot/apps/wall-agent's `sim` driver). Point this at
@@ -97,6 +111,36 @@ class Settings(BaseModel):
     # plus this long after it stops, or it reliably hears (and reacts to)
     # its own voice. Matches humanoid-robot's voice_live/runner.py.
     robot_post_speech_guard_ms: int = int(os.environ.get("ROBOT_POST_SPEECH_GUARD_MS", "750"))
+
+    # Presence detection (app/presence.py, app/robot_camera.py) — greets a
+    # visitor once they appear, per R1 ТЗ §4.1 / G1 ТЗ §3.1. Camera access
+    # itself is confirmed working on the real G1 (VideoClient.GetImageSample
+    # returns real JPEG frames, no segfault) — but the auto-greet behaviour
+    # is still off by default pending a live end-to-end check, and pending
+    # resolving whether this camera's fisheye/downward field of view (it's
+    # the go2-namespace "front video" service, likely a navigation camera,
+    # not an eye-level one) is actually suitable for spotting an approaching
+    # visitor. See README.
+    presence_enabled: bool = os.environ.get("PRESENCE_ENABLED", "false").lower() == "true"
+    presence_camera_network_interface: str = os.environ.get("PRESENCE_CAMERA_IFACE", "eth10")
+    # Fraction of the (downscaled, grayscale) frame that must change to count
+    # as "someone's here" — same default as humanoid-robot's apps/presence,
+    # tuned for a mostly-static exhibition hall.
+    presence_threshold: float = float(os.environ.get("PRESENCE_THRESHOLD", "0.02"))
+    # Minimum seconds between one greeting and the next being possible —
+    # single cooldown layer (see app/presence.py's module docstring for why
+    # this project doesn't need humanoid-robot's second, service-level one).
+    presence_rearm_s: float = float(os.environ.get("PRESENCE_REARM_S", "60.0"))
+    # How often app/presence.py's detector samples the shared camera hub
+    # (app/camera_hub.py) — independent of the hub's own DDS poll rate below,
+    # since detecting "someone's here" doesn't need every frame.
+    presence_fps: float = float(os.environ.get("PRESENCE_FPS", "2.0"))
+    # The shared hub's actual DDS poll rate (app/camera_hub.py) — this is
+    # what web/'s <img> camera view gets, so it's tuned for "looks live in a
+    # browser" the way humanoid-robot's camera_mjpeg.py bridge is (its
+    # default is 12fps; lower here since we don't know yet how this exact
+    # VideoClient/DDS link tolerates sustained polling).
+    presence_camera_fps: float = float(os.environ.get("PRESENCE_CAMERA_FPS", "8.0"))
 
     # Where app/main.py (the browser text/status UI) plays Gemini's audio
     # back: "browser" streams it to the page over the WS (default — works

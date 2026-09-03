@@ -1,6 +1,6 @@
 // Video-wall sections (MinTrans app). Keys mirror WallSection
 // (app/wall/commands.py) — the app's own screen names. Ported verbatim from
-// ../../humanoid-robot/web/dashboard/src/lib/labels.ts — this prototype only
+// ../../humanoid-robot/web/dashboard/src/lib/labels.ts — this project only
 // needs the wall-related exports, not the gesture/posture/deny-reason ones
 // that page owns for a robot with hands and an e-stop.
 export const WALL_SECTIONS: { key: string; label: string }[] = [

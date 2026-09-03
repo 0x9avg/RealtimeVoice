@@ -9,7 +9,7 @@ import { TabBar } from "./components/TabBar";
 // has 12 more dev-console routes (Motions/Safety/Robot/VoiceSessions/
 // Network/Knowledge/QA/Adapters/Plugins/Events/Diagnostics/Settings/Map) for
 // a robot with hands, an e-stop and lidar — none apply here. Only the 3
-// routes this prototype actually serves remain.
+// routes this project actually serves remain.
 
 function PrimaryLayout() {
   return (

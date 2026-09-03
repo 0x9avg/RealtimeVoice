@@ -10,7 +10,7 @@ import "./index.css";
 // Trimmed from ../../humanoid-robot/web/dashboard/src/main.tsx: no
 // EventStreamProvider/BusToastBridge/ToastProvider/WatchdogHeartbeat — those
 // all exist for that backend's NATS-style event bus and safety heartbeat,
-// neither of which this prototype has. QueryClientProvider + AuthPrompt
+// neither of which this project has. QueryClientProvider + AuthPrompt
 // (the token-gate for /api/visits*, /api/wall/command) are what's actually
 // load-bearing here.
 

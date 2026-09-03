@@ -1,19 +1,26 @@
-"""FastAPI bridge between the browser and one Gemini Live session.
+"""FastAPI bridge between browsers and the one shared Gemini Live session.
 
-One WebSocket connection (`/ws/session`) == one `GeminiLiveAdapter` session.
-Binary WS frames carry raw PCM16 audio in both directions; JSON text frames
-carry control/status messages. See `web-src/src/lib/useVoiceSession.ts` for
-the browser side of this protocol (built into `web/`, which this module
-serves as a static SPA — see `spa_fallback` below).
+There is exactly ONE `SessionHub` (app/session_hub.py) for the life of this
+process, started at server startup and kept alive regardless of how many
+browsers are connected. `/ws/session` is a thin subscribe/publish layer over
+it: every connected browser sees the same transcript/tool log and controls
+the same conversation (text, mic on/off, mute) — open the site on two
+devices and both show the same page, because there both looking at the same
+session, not each getting their own. Binary WS frames carry raw PCM16 audio
+in both directions; JSON text frames carry control/status messages. See
+`web-src/src/lib/useVoiceSession.ts` for the browser side of this protocol
+(built into `web/`, which this module serves as a static SPA — see
+`spa_fallback` below).
 """
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
+import hmac
 import json
 import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import AsyncIterator
 
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import FileResponse
@@ -21,108 +28,58 @@ from fastapi.staticfiles import StaticFiles
 
 from app.api_routes import router as api_router
 from app.config import settings
-from app.gemini_live import (
-    AudioChunk,
-    ConnectionStateChanged,
-    GeminiLiveAdapter,
-    Interrupted,
-    ToolCall,
-    Transcript,
-    TurnComplete,
-)
-from app.g1_tools import log_relay_divergence
-from app.robot_audio import HalfDuplexGate, RobotMic, RobotSpeaker
-from app.tool_registry import build_tool_registry
+from app.session_hub import SessionHub
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-_LOG = logging.getLogger("prototype")
+_LOG = logging.getLogger("realtimevoice")
 
 _WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
-app = FastAPI(title="RealtimeVoice prototype")
+session_hub = SessionHub(settings)
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    await session_hub.start()
+    try:
+        yield
+    finally:
+        await session_hub.stop()
+
+
+app = FastAPI(title="RealtimeVoice", lifespan=_lifespan)
 app.include_router(api_router)
 
 
 @app.websocket("/ws/session")
 async def session(ws: WebSocket) -> None:
     await ws.accept()
-
-    api_key = settings.resolved_api_key()
-    if not api_key:
-        await ws.send_json(
-            {
-                "type": "status",
-                "state": "error",
-                "detail": f"no Gemini API key set: export {settings.api_key_env}",
-            }
-        )
-        await ws.close()
+    # Same secret/rule as app/auth.py's require_token (REST endpoints) —
+    # empty settings.access_token means "no token configured", no-op, same
+    # as everywhere else. A WS handshake can't carry an Authorization
+    # header from browser JS, so this is query-param only (?token=...),
+    # same as the camera <img> stream. This is the ONE actuator surface
+    # that used to have NO auth check at all: anyone on the same network
+    # could open this socket directly (bypassing the page entirely) and
+    # talk to/control the robot — mute it, drive the wall, run visit_intake
+    # — without ever touching the UI. Close with a distinct 4401 code so
+    # the browser side (useVoiceSession.ts) can tell "wrong/missing token"
+    # apart from an ordinary disconnect and prompt for one.
+    # hmac.compare_digest, not != — see app/auth.py's require_token for why
+    # a plain string comparison is a timing side channel.
+    if settings.access_token and not hmac.compare_digest(
+        ws.query_params.get("token", ""), settings.access_token
+    ):
+        await ws.close(code=4401, reason="unauthorized")
         return
-
-    tools = build_tool_registry(settings)
-    _LOG.info("session.start profile=%s tools=%s", settings.robot_profile, tools.names())
-    adapter = GeminiLiveAdapter(settings=settings, tools=tools)
-    await ws.send_json(
-        {
-            "type": "capabilities",
-            # Whether a robot mic source can actually be selected — see
-            # AUDIO_INPUT in app/config.py; browser mic is always offered.
-            "robot_mic": settings.audio_input == "robot",
-        }
-    )
-    # "robot": play Gemini's audio through the real robot speaker instead of
-    # streaming it to the browser — text input/status/tool log stay in the
-    # browser either way. See app/config.py's AUDIO_OUTPUT.
-    speaker = (
-        RobotSpeaker(
-            network_interface=settings.robot_speaker_network_interface,
-            volume_pct=settings.robot_speaker_volume_pct,
-        )
-        if settings.audio_output == "robot"
-        else None
-    )
-    # "robot": stream the real head-mic multicast into the session instead of
-    # the browser's mic button — half-duplex-gated the same way robot_main.py
-    # does (mute while the robot itself is speaking). See AUDIO_INPUT.
-    mic = (
-        RobotMic(
-            multicast_group=settings.robot_mic_multicast_group,
-            multicast_port=settings.robot_mic_multicast_port,
-            interface_ip=settings.robot_mic_interface_ip,
-            input_channels=settings.robot_mic_input_channels,
-        )
-        if settings.audio_input == "robot"
-        else None
-    )
-    gate = (
-        HalfDuplexGate(guard_s=settings.robot_post_speech_guard_ms / 1000.0)
-        if mic is not None
-        else None
-    )
-    # Which mic the browser has told us is active right now — switchable
-    # live via a {"type":"mic_source"} control message, not fixed at session
-    # start, so one page can offer both "Микрофон браузера" and "Встроенный
-    # микрофон робота" with a single working Start-mic button either way.
+    await session_hub.join(ws)
+    # This one browser tab's own choice of input route — "browser" (its own
+    # mic, captured client-side) or not. Per-connection on purpose: unlike
+    # the robot's mic (a shared piece of hardware — see
+    # app/robot_mic_state.py), a browser's own mic is inherently local to
+    # that one tab, so there's nothing global to synchronise here.
     mic_source = "none"
-    # For app/g1_tools.py's log_relay_divergence: what the last relay-
-    # sensitive tool call returned, and the model's spoken text accumulated
-    # since then (outputAudioTranscription can arrive in fragments — compare
-    # the joined turn, not a partial piece, at TurnComplete).
-    last_tool_name: str | None = None
-    last_tool_text = ""
-    model_turn_fragments: list[str] = []
-
-    async def robot_mic_task() -> None:
-        assert mic is not None  # noqa: S101 — only created/started together
-        async for pcm in mic.stream():
-            if mic_source != "robot":
-                continue
-            if gate is not None and gate.mic_muted:
-                continue
-            await adapter.send_audio(pcm)
-
-    async def forward_from_browser() -> None:
-        nonlocal mic_source
+    try:
         while True:
             message = await ws.receive()
             if message.get("type") == "websocket.disconnect":
@@ -131,7 +88,7 @@ async def session(ws: WebSocket) -> None:
             data = message.get("bytes")
             if data is not None:
                 if mic_source == "browser":
-                    await adapter.send_audio(data)
+                    await session_hub.handle_browser_audio(data)
                 continue
             text = message.get("text")
             if text is None:
@@ -141,97 +98,16 @@ async def session(ws: WebSocket) -> None:
             except json.JSONDecodeError:
                 continue
             if payload.get("type") == "text":
-                await adapter.send_text(str(payload.get("text", "")))
+                await session_hub.handle_text(str(payload.get("text", "")))
             elif payload.get("type") == "mic_source":
                 source = str(payload.get("source", "none"))
                 if source in ("browser", "robot", "none"):
                     mic_source = source
-                    _LOG.info("mic_source -> %s", mic_source)
-
-    async def forward_from_gemini() -> None:
-        nonlocal last_tool_name, last_tool_text, model_turn_fragments
-        async for event in adapter.events():
-            match event:
-                case AudioChunk(pcm=pcm):
-                    if gate is not None:
-                        gate.on_speaking_started()
-                    if speaker is not None:
-                        await speaker.play(pcm, sample_rate_hz=settings.receive_sample_rate_hz)
-                        await ws.send_json({"type": "robot_audio", "bytes": len(pcm)})
-                    else:
-                        await ws.send_bytes(pcm)
-                case ConnectionStateChanged(state=state, detail=detail):
-                    log_fn = _LOG.warning if state == "closed" else _LOG.info
-                    log_fn("gemini.connection_state state=%s detail=%s", state, detail)
-                    await ws.send_json({"type": "status", "state": state, "detail": detail})
-                case TurnComplete():
-                    if gate is not None:
-                        gate.on_speaking_stopped()
-                    if speaker is not None:
-                        # Close out the vendor stream cleanly (see
-                        # RobotSpeaker.stop's docstring) — without this the
-                        # second+ utterance of a session can go silently
-                        # mute on the real robot speaker.
-                        await speaker.stop()
-                    if last_tool_name is not None and model_turn_fragments:
-                        log_relay_divergence(
-                            last_tool_name, last_tool_text, "".join(model_turn_fragments)
-                        )
-                    last_tool_name, last_tool_text, model_turn_fragments = None, "", []
-                    await ws.send_json({"type": "turn_complete"})
-                case Interrupted():
-                    if gate is not None:
-                        gate.on_speaking_stopped()
-                    if speaker is not None:
-                        await speaker.stop()
-                    # Barge-in cut the turn short — not a relay divergence.
-                    last_tool_name, last_tool_text, model_turn_fragments = None, "", []
-                    await ws.send_json({"type": "interrupted"})
-                case Transcript(role=role, text=text):
-                    if role == "model":
-                        model_turn_fragments.append(text)
-                    await ws.send_json({"type": "transcript", "role": role, "text": text})
-                case ToolCall() as call:
-                    _LOG.info("tool_call name=%s args=%s", call.name, call.args)
-                    await ws.send_json(
-                        {"type": "tool_call", "name": call.name, "args": call.args}
-                    )
-                    result = await tools.dispatch(call.name, call.args)
-                    await call.respond(result.text)
-                    last_tool_name, last_tool_text, model_turn_fragments = call.name, result.text, []
-                    await ws.send_json(
-                        {
-                            "type": "tool_result",
-                            "name": call.name,
-                            "ok": result.ok,
-                            "text": result.text,
-                        }
-                    )
-
-    tasks = [
-        asyncio.create_task(forward_from_browser(), name="ws-from-browser"),
-        asyncio.create_task(forward_from_gemini(), name="ws-from-gemini"),
-    ]
-    if mic is not None:
-        tasks.append(asyncio.create_task(robot_mic_task(), name="robot-mic"))
-    try:
-        done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for task in done:
-            exc = task.exception()
-            if exc is not None:
-                _LOG.warning("session.task_ended name=%s", task.get_name(), exc_info=exc)
+                    await session_hub.handle_mic_source(source)
+            elif payload.get("type") == "mute":
+                await session_hub.handle_mute()
     finally:
-        for task in tasks:
-            task.cancel()
-        for task in tasks:
-            # CancelledError is a BaseException, not an Exception — it must be
-            # suppressed explicitly or it propagates out of this handler and
-            # gets logged as an unhandled error on every normal disconnect.
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await task
-        if mic is not None:
-            await mic.close()
-        await adapter.close()
+        session_hub.leave(ws)
 
 
 app.mount("/assets", StaticFiles(directory=_WEB_DIR / "assets"), name="web-assets")

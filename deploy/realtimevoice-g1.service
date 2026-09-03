@@ -1,0 +1,35 @@
+[Unit]
+Description=RealtimeVoice — G1 security-desk profile (FastAPI + Gemini Live)
+# Best-effort ordering after networking -- the app itself also tolerates
+# starting before Wi-Fi is up: GeminiLiveAdapter.events() retries with
+# backoff on connection failure (app/gemini_live.py), so a slow network
+# doesn't stop the service from eventually starting to work.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# A dedicated working directory per profile (not shared with the R1 unit)
+# -- .env, data/ (visit journal), config/guard-kb.yaml never collide even
+# if both profiles ever end up running on the same host (see DEPLOYMENT.md).
+WorkingDirectory=%h/realtimevoice-g1
+Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Required for any unitree_sdk2py DDS call (audio/camera) -- see
+# ../README.md's "Запуск на роботе" for why this exact path, not /usr/local.
+Environment=LD_LIBRARY_PATH=%h/cyclonedds_ws/install/cyclonedds/lib
+Environment=CYCLONEDDS_URI=%h/cyclonedds_ws/cyclonedds.xml
+# Authoritative source of truth for which profile this instance runs --
+# wins over whatever ROBOT_PROFILE (if any) is set in .env, since
+# python-dotenv's load_dotenv() does not override an already-set process
+# environment variable by default (see app/config.py).
+Environment=ROBOT_PROFILE=g1
+ExecStart=%h/.local/bin/uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
+Restart=on-failure
+RestartSec=3
+# Covers both a clean crash AND a hung process (a stuck DDS/vendor-SDK call
+# in a background thread that ignores SIGTERM) -- give it a real chance to
+# die before restarting.
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target

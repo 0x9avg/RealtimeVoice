@@ -16,7 +16,7 @@ Loaded from a plain-text-editable YAML file (default: config/guard-kb.yaml):
 Same field shape as ../../humanoid-robot's apps/rag/src/humanoid_robot/rag/
 guard_kb.py, reimplemented here (plain dataclass, no pydantic/observability
 dependency) so real customer data can move between the two without
-reformatting if this prototype's data ever needs to feed the production KB
+reformatting if this project's data ever needs to feed the production KB
 or vice versa.
 
 Two consumption paths, used by app/g1_tools.py's SearchGuardKbTool:
@@ -27,7 +27,7 @@ Two consumption paths, used by app/g1_tools.py's SearchGuardKbTool:
 * ``reference_block()`` — the whole KB rendered as a справка block, for a
   future static-prompt use case (not currently wired into the system
   instruction — search_guard_kb hands the caller kb facts as a tool result
-  instead, matching how search_knowledge already works in this prototype).
+  instead, matching how search_knowledge already works here).
 """
 
 from __future__ import annotations

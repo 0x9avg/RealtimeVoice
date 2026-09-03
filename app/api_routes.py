@@ -1,4 +1,4 @@
-"""Operator-panel REST API for web/wall.html and web/guard.html.
+"""Operator-panel REST API for the web-src/ (React) frontend.
 
 Kept separate from the WS voice pipeline (app/main.py's /ws/session) on
 purpose: these are the "administrative functions" G1 ТЗ §7 wants gated by
@@ -13,13 +13,17 @@ from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import Response, StreamingResponse
 
 from app.auth import require_token
+from app.camera_hub import camera_hub
 from app.config import settings
 from app.g1_tools import mark_visit_processed, read_visits
 from app.wall.commands import WallCommand
 
 router = APIRouter(prefix="/api")
+
+_MJPEG_BOUNDARY = "frame"
 
 
 @router.get("/profile")
@@ -75,3 +79,42 @@ async def wall_health() -> dict[str, Any]:
         return response.json()
     except httpx.HTTPError:
         return {"status": "unreachable", "driver": ""}
+
+
+def _mjpeg_part(frame: bytes) -> bytes:
+    return (
+        f"--{_MJPEG_BOUNDARY}\r\nContent-Type: image/jpeg\r\nContent-Length: {len(frame)}\r\n\r\n"
+    ).encode() + frame + b"\r\n"
+
+
+@router.get("/camera/snapshot", dependencies=[Depends(require_token)])
+async def camera_snapshot() -> Response:
+    frame = await camera_hub.snapshot()
+    if frame is None:
+        raise HTTPException(status_code=503, detail="no camera frame available")
+    return Response(content=frame, media_type="image/jpeg")
+
+
+@router.get("/camera/stream", dependencies=[Depends(require_token)])
+async def camera_stream() -> Response:
+    """multipart/x-mixed-replace MJPEG — the browser-native way to show a
+    live camera in a plain <img> tag, same as humanoid-robot's camera_mjpeg.py.
+
+    Waits for the first frame (or a definitive "unavailable") via
+    camera_hub.snapshot() *before* opening the streaming response — an
+    immediately-started StreamingResponse that then closes with zero bytes
+    is a 200 as far as the browser's <img> is concerned, so it never fires
+    onError; a real 503 up front does.
+    """
+    first_frame = await camera_hub.snapshot()
+    if first_frame is None:
+        raise HTTPException(status_code=503, detail="no camera frame available")
+
+    async def multipart() -> Any:
+        yield _mjpeg_part(first_frame)
+        async for frame in camera_hub.stream():
+            yield _mjpeg_part(frame)
+
+    return StreamingResponse(
+        multipart(), media_type=f"multipart/x-mixed-replace; boundary={_MJPEG_BOUNDARY}"
+    )

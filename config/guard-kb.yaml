@@ -1,7 +1,10 @@
-# Guard-desk reference data (app/guard_kb.py). Placeholder test-bench
-# content — swap in the customer's actual room directory/FAQ/info when
-# available. Same field shape as ../../humanoid-robot's guard-kb.yaml, for
-# portability if real data ever needs to move between the two.
+# Guard-desk reference data (app/guard_kb.py). The room directory and FAQ
+# below are example entries — replace them with the customer's actual room
+# directory, FAQ and venue info before going into production; the robot only
+# ever answers from what's in this file (see SearchGuardKbTool), so an empty
+# or example-only file means it will honestly say it doesn't know rather
+# than invent an answer. Same field shape as ../../humanoid-robot's
+# guard-kb.yaml, for portability if data ever needs to move between the two.
 
 rooms:
   - room: "305"
@@ -22,6 +25,5 @@ faq:
     a: "При себе необходимо иметь удостоверение личности; при наличии — предварительно оформленный пропуск."
 
 info: |
-  Это тестовые данные для стенда, не согласованные с заказчиком. При отсутствии
-  ответа в справочнике — сообщите об этом честно и предложите обратиться к
-  сотруднику охраны.
+  При отсутствии ответа в справочнике — сообщите об этом честно и предложите
+  обратиться к сотруднику охраны.

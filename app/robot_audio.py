@@ -39,6 +39,8 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.dds import ensure_channel_factory
+
 # audioop is stdlib on 3.12, removed in 3.13 (add audioop-lts then). Silence
 # just this import's DeprecationWarning, matching the upstream adapter.
 with warnings.catch_warnings():
@@ -57,7 +59,7 @@ class UnitreeSdkNotAvailableError(RuntimeError):
     def __init__(self) -> None:
         super().__init__(
             "unitree_sdk2py is not importable in this environment. Build it "
-            "on the robot per RealtimeVoice/prototype/README.md (CycloneDDS "
+            "on the robot per this project's README.md (CycloneDDS "
             "0.10.2 + `uv pip install git+https://github.com/"
             "unitreerobotics/unitree_sdk2_python.git`)."
         )
@@ -159,9 +161,7 @@ _LEAD_S = 0.2
 
 def _require_sdk() -> Any:
     try:
-        return importlib.import_module("unitree_sdk2py.core.channel"), importlib.import_module(
-            "unitree_sdk2py.g1.audio.g1_audio_client"
-        )
+        return importlib.import_module("unitree_sdk2py.g1.audio.g1_audio_client")
     except ImportError as exc:
         raise UnitreeSdkNotAvailableError from exc
 
@@ -179,7 +179,6 @@ class RobotSpeaker:
     volume_pct: int = 100
     app_name: str = "realtimevoice"
     _client: Any = field(default=None, init=False, repr=False)
-    _channel_initialised: bool = field(default=False, init=False)
     _stream_id: str = field(default="", init=False)
     _next_send_monotonic: float = field(default=0.0, init=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
@@ -189,10 +188,8 @@ class RobotSpeaker:
     def _ensure_client(self) -> Any:
         if self._client is not None:
             return self._client
-        channel_mod, audio_client_mod = _require_sdk()
-        if not self._channel_initialised:
-            channel_mod.ChannelFactoryInitialize(0, self.network_interface)
-            self._channel_initialised = True
+        audio_client_mod = _require_sdk()
+        ensure_channel_factory(self.network_interface)
         client = audio_client_mod.AudioClient()
         client.SetTimeout(10.0)
         client.Init()

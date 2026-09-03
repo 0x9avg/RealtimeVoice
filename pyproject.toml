@@ -1,7 +1,7 @@
 [project]
-name = "realtimevoice-prototype"
-version = "0.1.0"
-description = "Computer-only speech-to-speech prototype: Gemini Live API + tool calling."
+name = "realtimevoice"
+version = "1.0.0"
+description = "Speech-to-speech voice AI backend for the Unitree R1/G1 robots — Gemini Live API + tool calling."
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115",
@@ -13,6 +13,13 @@ dependencies = [
     # app/guard_kb.py's `import yaml` — was only present transitively via
     # uvicorn[standard] before the g1 profile needed it directly.
     "pyyaml>=6.0",
+    # app/presence.py's MotionDetector (JPEG decode + grayscale diff). Both
+    # were already present on the robot transitively via the manually
+    # installed unitree_sdk2py stack — same class of risk `pyyaml` was
+    # before it got listed explicitly (a `uv sync` can prune what it doesn't
+    # know is needed).
+    "numpy>=1.26",
+    "pillow>=10.0",
     # audioop (app/robot_audio.py's resampling) is stdlib on 3.12, removed in
     # 3.13+. The robot runs 3.12; this shim only matters for dev machines on
     # newer Python (this one is 3.14).
@@ -23,6 +30,15 @@ dependencies = [
 # git repo (see README.md's "Запуск на роботе"). Not listed as a dependency
 # here — app/robot_audio.py imports it lazily so the rest of this package
 # stays installable everywhere else.
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
 
 [build-system]
 requires = ["hatchling"]

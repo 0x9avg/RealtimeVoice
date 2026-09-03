@@ -1,7 +1,7 @@
 """Tool registry for the voice session — the only thing the model can reach
 besides talking.
 
-Deliberately minimal for the first prototype: one read-only tool
+Deliberately minimal for now: one read-only tool
 (`get_current_time`), no allowlist/policy engine, no idempotency/`call_id`
 dedup — those belong to a real Tool Broker once there is more than one
 side-effect-free tool to gate (see ../CLAUDE.md and the overview doc's
@@ -110,7 +110,7 @@ class GetCurrentTimeTool:
 # ../../humanoid-robot/deploy/config/presenter-kb.yaml, itself generated from
 # MinTrans's own Datas/*/BlockInfoView — kept here only for the tool
 # description the model reads, not as a source of truth for facts (that
-# stays presenter-kb.yaml's job once this prototype grows a knowledge layer).
+# stays presenter-kb.yaml's job once this project grows a knowledge layer).
 _SECTION_NAMES_RU: dict[str, str] = {
     "Avto1": "автодорога Кызылорда — Жезказган",
     "Avto2": "автодорога Актобе — Карабутак — Улгайсын",
@@ -145,7 +145,7 @@ class ControlVideoWallTool:
     """Drives the demo video wall (Unity app «Factories», project MinTrans).
 
     Talks HTTP to a wall-agent (see app/wall/ for the local `sim` instance
-    used in this prototype) — never touches the wall application directly,
+    used here) — never touches the wall application directly,
     mirroring how the real presenter robot's Tool Broker is required to work
     (see ../CLAUDE.md).
     """

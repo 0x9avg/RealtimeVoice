@@ -28,12 +28,20 @@ export function onUnauthorized(listener: () => void): () => void {
   return () => unauthorizedListeners.delete(listener);
 }
 
+// Exported so callers OTHER than fetchJson (currently: useVoiceSession.ts,
+// when /ws/session closes with the 4401 "wrong/missing token" code — see
+// app/main.py) can trigger the exact same "show the token prompt" flow as
+// an ordinary REST 401, instead of each surface reinventing its own modal.
+export function notifyUnauthorized(): void {
+  unauthorizedListeners.forEach((listener) => listener());
+}
+
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   if (cachedToken) headers.set("Authorization", `Bearer ${cachedToken}`);
   const response = await fetch(path, { ...init, headers });
   if (response.status === 401) {
-    unauthorizedListeners.forEach((listener) => listener());
+    notifyUnauthorized();
     throw new Error("unauthorized");
   }
   if (!response.ok) {

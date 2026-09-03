@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 data/
 .embeddings_cache.json
+.pytest_cache/

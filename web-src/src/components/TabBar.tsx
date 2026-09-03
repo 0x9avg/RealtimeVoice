@@ -8,10 +8,10 @@ import { cn } from "../lib/cn";
 // Adapted from
 // ../../humanoid-robot/web/dashboard/src/components/TabBar.tsx — same
 // role-gated-tabs idea (there: api.info().role; here: GET /api/profile,
-// since this prototype's "role" is ROBOT_PROFILE, not a robot manifest
-// field), trimmed to the 3 routes this prototype actually has. The
+// since this project's "role" is ROBOT_PROFILE, not a robot manifest
+// field), trimmed to the 3 routes this project actually has. The
 // original also shows Движения/Состояние/Карта/Ещё — not ported, this
-// prototype has no motion/telemetry/map/settings surface to link to.
+// project has no motion/telemetry/map/settings surface to link to.
 
 const HOME_TAB = { to: "/", label: "Главная", icon: Home };
 const WALL_TAB = { to: "/wall", label: "Видеостена", icon: MonitorPlay };
