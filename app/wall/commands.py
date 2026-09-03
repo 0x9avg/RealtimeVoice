@@ -67,13 +67,16 @@ WALL_CATEGORY_SECTIONS: dict[WallCategory, tuple[WallSection, ...]] = {
 
 
 class WallNavAction(StrEnum):
-    """Navigation actions that do not target a specific section."""
+    """Navigation actions that do not target a specific section.
+
+    Used to include NEXT_SECTION/PREV_SECTION/NEXT_SLIDE/PREV_SLIDE — cut
+    entirely (not just from the frontend): the real Factories.exe app has no
+    way to step through sections or slides forward/back, so exposing those
+    as callable actions (even the sim driver's best-effort emulation of
+    them) was offering a capability the real wall doesn't have.
+    """
 
     MAIN_MENU = "main_menu"
-    NEXT_SECTION = "next_section"
-    PREV_SECTION = "prev_section"
-    NEXT_SLIDE = "next_slide"
-    PREV_SLIDE = "prev_slide"
 
 
 class WallCommandKind(StrEnum):

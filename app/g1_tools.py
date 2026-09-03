@@ -12,6 +12,7 @@ from __future__ import annotations
 import difflib
 import json
 import logging
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -57,17 +58,79 @@ def log_relay_divergence(
 
 @dataclass(slots=True)
 class VisitJournal:
-    """Append-only JSONL log of completed visit cards. Test-bench-simple: no
-    DB, no locking beyond one process writing — matches this repo's existing
-    "JSON file, no DB" precedent (app/knowledge.py's embeddings cache)."""
+    """Append-only-by-default JSONL log of completed visit cards. Test-bench-
+    simple: no DB, no locking beyond one process writing — matches this
+    repo's existing "JSON file, no DB" precedent (app/knowledge.py's
+    embeddings cache). Each record gets an `id` and `status: "new"` so
+    app/api_routes.py's guard panel can list and later mark them processed
+    (see read_visits/mark_visit_processed below — those are plain functions,
+    not methods here, because the REST endpoint has no VisitJournal instance
+    to call into: it isn't tied to any particular live WS session)."""
 
     path: Path
 
-    def append(self, card: dict[str, object]) -> None:
-        record = {"ts": datetime.now(UTC).isoformat(), **card}
+    def append(self, card: dict[str, object]) -> dict[str, object]:
+        record = {
+            "id": uuid.uuid4().hex[:12],
+            "ts": datetime.now(UTC).isoformat(),
+            "status": "new",
+            **card,
+        }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return record
+
+
+def _read_all_visits(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    records = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            records.append(json.loads(line))
+    return records
+
+
+def _write_all_visits(path: Path, records: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def read_visits(
+    path: Path, *, status: str | None = None, limit: int | None = None
+) -> list[dict[str, Any]]:
+    """Newest first — matches how the guard panel wants to see arrivals.
+
+    Records written before this field existed have no `status` at all —
+    default those to "new" rather than dropping them from every filtered
+    view.
+    """
+    records = list(reversed(_read_all_visits(path)))
+    if status is not None:
+        records = [r for r in records if r.get("status", "new") == status]
+    if limit is not None:
+        records = records[:limit]
+    return records
+
+
+def mark_visit_processed(path: Path, visit_id: str) -> bool:
+    """Rewrites the whole file with the matching record's status flipped —
+    fine at test-bench scale (append() above does the same order of work on
+    every completed visit already)."""
+    records = _read_all_visits(path)
+    found = False
+    for record in records:
+        if record.get("id") == visit_id:
+            record["status"] = "processed"
+            found = True
+            break
+    if found:
+        _write_all_visits(path, records)
+    return found
 
 
 @dataclass(slots=True)

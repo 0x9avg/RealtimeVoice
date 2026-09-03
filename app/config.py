@@ -132,6 +132,13 @@ class Settings(BaseModel):
         "VISIT_JOURNAL_PATH", str(_ROOT / "data" / "visits.jsonl")
     )
 
+    # Operator-panel endpoints (app/api_routes.py — visits list/processed,
+    # wall command proxy). Empty (default) disables the check entirely, so
+    # the test bench works with zero setup; set a real value to require
+    # `Authorization: Bearer <token>` (G1 ТЗ §7 — admin functions must be
+    # authorized-only).
+    access_token: str = os.environ.get("ACCESS_TOKEN", "")
+
     @property
     def system_instruction(self) -> str:
         """Profile-specific instruction (see app/scenarios.py) — not a plain

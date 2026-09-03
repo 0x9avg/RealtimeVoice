@@ -2,8 +2,9 @@
 
 One WebSocket connection (`/ws/session`) == one `GeminiLiveAdapter` session.
 Binary WS frames carry raw PCM16 audio in both directions; JSON text frames
-carry control/status messages. See `web/app.js` for the browser side of this
-protocol.
+carry control/status messages. See `web-src/src/lib/useVoiceSession.ts` for
+the browser side of this protocol (built into `web/`, which this module
+serves as a static SPA — see `spa_fallback` below).
 """
 
 from __future__ import annotations
@@ -15,8 +16,10 @@ import logging
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from app.api_routes import router as api_router
 from app.config import settings
 from app.gemini_live import (
     AudioChunk,
@@ -37,6 +40,7 @@ _LOG = logging.getLogger("prototype")
 _WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
 app = FastAPI(title="RealtimeVoice prototype")
+app.include_router(api_router)
 
 
 @app.websocket("/ws/session")
@@ -230,4 +234,19 @@ async def session(ws: WebSocket) -> None:
         await adapter.close()
 
 
-app.mount("/", StaticFiles(directory=_WEB_DIR, html=True), name="web")
+app.mount("/assets", StaticFiles(directory=_WEB_DIR / "assets"), name="web-assets")
+
+
+@app.get("/{full_path:path}")
+async def spa_fallback(full_path: str) -> FileResponse:
+    """React Router does client-side routing (/wall, /guard aren't real
+    files) — StaticFiles(html=True) alone can't serve index.html for those,
+    only for `/`. Registered last so it never shadows /ws/session or the
+    /api/* router above; falls back to index.html for anything that isn't a
+    real static asset (e.g. capture-worklet.js, served from web-src/public/
+    verbatim by the Vite build).
+    """
+    candidate = _WEB_DIR / full_path
+    if full_path and candidate.is_file():
+        return FileResponse(candidate)
+    return FileResponse(_WEB_DIR / "index.html")

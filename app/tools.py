@@ -137,7 +137,7 @@ _CATEGORY_LABELS_RU: dict[str, str] = {
     WallCategory.AERO.value: "аэропорты",
 }
 
-_NAV_ACTIONS = ("main_menu", "next_section", "prev_section", "next_slide", "prev_slide")
+_NAV_ACTIONS = ("main_menu",)
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,11 +160,12 @@ class ControlVideoWallTool:
         "exact `section` code to show one specific project. Use "
         "kind='open_category' with `category` to show that category's own "
         "overview screen (e.g. all airports at once) — this is a real "
-        "screen in the app, not a substitute. Use kind='navigate' with `nav` "
-        "for the main menu or next/previous section/slide — note next/prev "
-        "slide only work once a specific section (not a category screen or "
-        "the main menu) is open. Never claim a switch succeeded unless this "
-        "tool reports it did."
+        "screen in the app, not a substitute. Use kind='navigate' with "
+        "nav='main_menu' to return to the main menu. There is no way to step "
+        "to the next/previous section or slide — the real wall app has no "
+        "such command — so always open the specific section or category the "
+        "visitor asked for by name instead. Never claim a switch succeeded "
+        "unless this tool reports it did."
     )
 
     @property

@@ -1,119 +1,13 @@
 <!doctype html>
 <html lang="ru">
-
-<head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>RealtimeVoice prototype</title>
-    <style>
-        body {
-            font-family: system-ui, sans-serif;
-            max-width: 720px;
-            margin: 40px auto;
-            padding: 0 16px;
-            color: #1a1a1a;
-        }
-
-        #status {
-            display: inline-block;
-            padding: 4px 10px;
-            border-radius: 999px;
-            background: #eee;
-            font-weight: 600;
-            font-size: 13px;
-            text-transform: uppercase;
-        }
-
-        .controls {
-            margin: 16px 0;
-            display: flex;
-            gap: 8px;
-            align-items: center;
-            flex-wrap: wrap;
-        }
-
-        #transcript,
-        #tool-log {
-            border: 1px solid #ddd;
-            border-radius: 8px;
-            padding: 8px 12px;
-            height: 200px;
-            overflow-y: auto;
-            margin-top: 8px;
-            font-size: 14px;
-        }
-
-        .transcript-line.user {
-            color: #1a5fb4;
-        }
-
-        .transcript-line.model {
-            color: #1a1a1a;
-        }
-
-        #tool-log {
-            font-family: ui-monospace, monospace;
-            color: #555;
-            font-size: 13px;
-        }
-
-        button {
-            cursor: pointer;
-            padding: 6px 14px;
-            border-radius: 6px;
-            border: 1px solid #ccc;
-            background: #fafafa;
-        }
-
-        button:hover {
-            background: #f0f0f0;
-        }
-
-        form {
-            display: flex;
-            gap: 8px;
-            margin-top: 8px;
-        }
-
-        input[type="text"] {
-            flex: 1;
-            padding: 6px 10px;
-            border-radius: 6px;
-            border: 1px solid #ccc;
-        }
-
-        h3 {
-            margin-bottom: 4px;
-        }
-    </style>
-</head>
-
-<body>
-    <h1>RealtimeVoice — прототип</h1>
-
-    <div class="controls">
-        <span>Статус: <span id="status">idle</span></span>
-        <label for="mic-source">Микрофон:</label>
-        <select id="mic-source">
-            <option value="browser">браузера</option>
-            <option value="robot" id="mic-source-robot-option">встроенный (робот)</option>
-        </select>
-        <button id="mic-toggle" type="button">Start mic</button>
-        <button id="mute" type="button">Замолчи</button>
-    </div>
-
-    <form id="text-form">
-        <input id="text-input" type="text" placeholder="Введите вопрос текстом..." autocomplete="off" />
-        <button type="submit">Send</button>
-    </form>
-
-    <h3>Транскрипт</h3>
-    <div id="transcript"></div>
-
-    <h3>Tool calls</h3>
-    <div id="tool-log"></div>
-
-    <script src="/app.js"></script>
-</body>
-
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>RealtimeVoice — оператор</title>
+    <script type="module" crossorigin src="/assets/index-DZGJ9mpa.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-CIEzp9O9.css">
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
 </html>

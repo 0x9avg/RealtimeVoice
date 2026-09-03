@@ -22,11 +22,11 @@ over plain HTTP via `WALL_AGENT_URL` and never needs to be on the same
 machine, or even the same OS — that boundary already existed (see
 `../server.py`) and nothing here changes it.
 
-`sendinput` (mouse/key emulation, needed for slides — PgUp/PgDn — since
-those have no pipe command at all, confirmed via `strings` on the real
-`level0` scene) is not ported: it requires on-site coordinate calibration
-against a real screen, which cannot be done from this repo. Run
-`cortex-wall-agent --driver sendinput` from `../../humanoid-robot` for that.
+Slide/section step-navigation (PgUp/PgDn, next/prev section) is not
+implemented anywhere in this module — the real Factories.exe app has no way
+to step through slides or sections forward/back, confirmed against the
+real app, so this command surface only ever opens a specific section or
+category by name, never "next"/"previous".
 """
 
 from __future__ import annotations
@@ -38,7 +38,6 @@ import time
 from typing import Any, Protocol
 
 from app.wall.commands import (
-    WALL_CATEGORY_SECTIONS,
     WallCategory,
     WallCommand,
     WallCommandKind,
@@ -51,7 +50,6 @@ from app.wall.commands import (
 log = logging.getLogger(__name__)
 
 _MAIN_SCREEN = "Main"
-_MAX_SLIDE = 99
 
 # Confirmed against the real scene (`strings level0`): MENU_AVTO/MENU_JD/
 # MENU_AERO are real pipe-addressable category screens, distinct from any
@@ -78,19 +76,12 @@ class WallDriver(Protocol):
         ...
 
 
-def _section_category(section: WallSection) -> WallCategory:
-    for category, sections in WALL_CATEGORY_SECTIONS.items():
-        if section in sections:
-            return category
-    msg = f"section {section} is not in any category"  # pragma: no cover
-    raise ValueError(msg)  # pragma: no cover
-
-
 class SimWallDriver:
     """In-memory model of the wall application.
 
-    Mirrors what the real app does: one main menu, 12 section screens, and a
-    slide sequence inside each section (PgUp/PgDn in the real app).
+    Mirrors what the real app does: one main menu, 12 section screens, and
+    the category overview screens — no slide/section step-navigation (see
+    module docstring for why).
     """
 
     name = "sim"
@@ -98,7 +89,6 @@ class SimWallDriver:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._screen: str = _MAIN_SCREEN
-        self._slide = 0
         self.history: list[WallCommand] = []
 
     def execute(self, command: WallCommand) -> WallCommandResult:
@@ -107,66 +97,22 @@ class SimWallDriver:
             if command.kind is WallCommandKind.OPEN_SECTION:
                 assert command.section is not None  # noqa: S101 — validated model
                 self._screen = command.section.value
-                self._slide = 0
                 log.info("sim: open section %s", command.section.value)
                 return WallCommandResult(outcome=WallCommandOutcome.ACCEPTED)
             if command.kind is WallCommandKind.OPEN_CATEGORY:
                 assert command.category is not None  # noqa: S101 — validated model
                 self._screen = _category_screen(command.category)
-                self._slide = 0
                 log.info("sim: open category %s", command.category.value)
                 return WallCommandResult(outcome=WallCommandOutcome.ACCEPTED)
             assert command.nav is not None  # noqa: S101 — validated model
-            return self._navigate(command.nav)
-
-    def _current_section(self) -> WallSection | None:
-        """The open section, or ``None`` on Main / a category screen.
-
-        A category screen (`MENU_AVTO` etc.) is a real, distinct screen in
-        the app — not "no section open" in the sense of Main — but it is
-        also not a project you can page through, so it behaves the same way
-        here for next/prev section/slide purposes.
-        """
-        try:
-            return WallSection(self._screen)
-        except ValueError:
-            return None
-
-    def _navigate(self, nav: WallNavAction) -> WallCommandResult:
-        if nav is WallNavAction.MAIN_MENU:
+            # WallNavAction has only MAIN_MENU left (see commands.py).
             self._screen = _MAIN_SCREEN
-            self._slide = 0
             log.info("sim: main menu")
             return WallCommandResult(outcome=WallCommandOutcome.ACCEPTED)
-        if nav in (WallNavAction.NEXT_SLIDE, WallNavAction.PREV_SLIDE):
-            if self._current_section() is None:
-                return WallCommandResult(
-                    outcome=WallCommandOutcome.REJECTED,
-                    detail="no section open",
-                )
-            step = 1 if nav is WallNavAction.NEXT_SLIDE else -1
-            self._slide = min(max(self._slide + step, 0), _MAX_SLIDE)
-            log.info("sim: slide -> %d", self._slide)
-            return WallCommandResult(outcome=WallCommandOutcome.ACCEPTED)
-        # next_section / prev_section — wrap within the current category.
-        current = self._current_section()
-        if current is None:
-            return WallCommandResult(
-                outcome=WallCommandOutcome.REJECTED,
-                detail="no section open",
-            )
-        sections = WALL_CATEGORY_SECTIONS[_section_category(current)]
-        index = sections.index(current)
-        step = 1 if nav is WallNavAction.NEXT_SECTION else -1
-        target = sections[(index + step) % len(sections)]
-        self._screen = target.value
-        self._slide = 0
-        log.info("sim: section -> %s", target.value)
-        return WallCommandResult(outcome=WallCommandOutcome.ACCEPTED)
 
     def state(self) -> dict[str, Any]:
         with self._lock:
-            return {"screen": self._screen, "slide": self._slide, "exact": True}
+            return {"screen": self._screen, "exact": True}
 
 
 # --- real app, native named pipe ------------------------------------------
@@ -214,14 +160,9 @@ class PipeWallDriver:
     handles it, and loops back to listen — matches `humanoid-robot`'s own
     `PipeWallDriver`.
 
-    `next_section`/`prev_section` have no dedicated pipe command either, but
-    unlike slides they don't need one: this driver tracks which section it
-    last successfully opened and just sends the *next* section's own
-    `open_section` command — the same wrap-within-category logic
-    `SimWallDriver` uses, now actually driving the real app. State tracking
-    is best-effort (never read back from the app, only from what this
-    driver itself has sent and had acknowledged) — `state()` reports
-    `exact: False` for that reason.
+    State tracking is best-effort (never read back from the app, only from
+    what this driver itself has sent and had acknowledged) — `state()`
+    reports `exact: False` for that reason.
     """
 
     name = "pipe"
@@ -275,30 +216,9 @@ class PipeWallDriver:
         return self._apply(menu, on_success_screen=_category_screen(category))
 
     def _navigate(self, nav: WallNavAction) -> WallCommandResult:
-        if nav is WallNavAction.MAIN_MENU:
-            return self._apply(_MENU_MAIN, on_success_screen=_MAIN_SCREEN)
-        if nav in (WallNavAction.NEXT_SLIDE, WallNavAction.PREV_SLIDE):
-            return WallCommandResult(
-                outcome=WallCommandOutcome.REJECTED,
-                detail=f"nav {nav.value} has no pipe command (use the sendinput driver)",
-            )
-        # next_section / prev_section: computed from tracked state, then
-        # issued as that section's own open_section command.
-        with self._lock:
-            current = self._current_section()
-        if current is None:
-            return WallCommandResult(outcome=WallCommandOutcome.REJECTED, detail="no section open")
-        sections = WALL_CATEGORY_SECTIONS[_section_category(current)]
-        index = sections.index(current)
-        step = 1 if nav is WallNavAction.NEXT_SECTION else -1
-        target = sections[(index + step) % len(sections)]
-        return self._open_section(target)
-
-    def _current_section(self) -> WallSection | None:
-        try:
-            return WallSection(self._screen)
-        except ValueError:
-            return None
+        # WallNavAction has only MAIN_MENU left (see commands.py).
+        assert nav is WallNavAction.MAIN_MENU  # noqa: S101 — only enum member
+        return self._apply(_MENU_MAIN, on_success_screen=_MAIN_SCREEN)
 
     def _apply(self, menu: str, *, on_success_screen: str) -> WallCommandResult:
         with self._lock:
@@ -318,8 +238,7 @@ class PipeWallDriver:
 
     def state(self) -> dict[str, Any]:
         with self._lock:
-            slide = 0 if self._current_section() is not None else None
-            return {"screen": self._screen, "slide": slide, "exact": False}
+            return {"screen": self._screen, "exact": False}
 
 
 def build_driver(name: str) -> WallDriver:

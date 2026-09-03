@@ -24,7 +24,6 @@ class WallStateResponse(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     screen: str
-    slide: int | None
     exact: bool
 
 
