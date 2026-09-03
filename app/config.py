@@ -24,6 +24,9 @@ _DEFAULT_WS_HOST = "generativelanguage.googleapis.com"
 _DEFAULT_MODEL = "models/gemini-3.1-flash-live-preview"
 _DEFAULT_VOICE = "Fenrir"
 _DEFAULT_TIMEZONE = "Asia/Almaty"
+# Not live-verified against this account the way the Live model above was —
+# same caveat applies: override via GEMINI_EMBEDDING_MODEL if this 404s.
+_DEFAULT_EMBEDDING_MODEL = "models/gemini-embedding-001"
 
 
 class Settings(BaseModel):
@@ -40,7 +43,13 @@ class Settings(BaseModel):
         "You are a helpful voice assistant running in a developer prototype. "
         "Speak naturally and concisely. When asked for the current time or "
         "date, always call the get_current_time tool instead of guessing — "
-        "you have no reliable sense of the current date on your own."
+        "you have no reliable sense of the current date on your own. For any "
+        "question that could be answered by the venue's own uploaded "
+        "documents (facts, numbers, names, procedures — anything specific to "
+        "this place), call search_knowledge first and answer only from what "
+        "it returns. If it finds nothing relevant, say so honestly and offer "
+        "to check with a person — never invent facts search_knowledge did "
+        "not give you."
     )
     send_sample_rate_hz: int = 16_000  # what the browser sends TO Gemini
     receive_sample_rate_hz: int = 24_000  # what Gemini sends back
@@ -94,6 +103,20 @@ class Settings(BaseModel):
     # becomes irrelevant in this mode. Set both AUDIO_INPUT and AUDIO_OUTPUT
     # to "robot" for the full on-robot experience with browser-side status.
     audio_input: str = os.environ.get("AUDIO_INPUT", "browser")
+
+    # RAG over app/../knowledge/ (see app/knowledge.py) — drop .txt/.md files
+    # in there and control_video_wall's neighbour tool, search_knowledge,
+    # embeds and searches them. Not a Structured Facts Store (see
+    # ../CLAUDE.md's Structured Facts Store vs. RAG distinction) — for facts
+    # that must never be wrong, a typed lookup is still the right answer;
+    # this is for prose/explanatory material.
+    knowledge_dir: str = os.environ.get(
+        "KNOWLEDGE_DIR", str(Path(__file__).resolve().parent.parent / "knowledge")
+    )
+    knowledge_embedding_model: str = os.environ.get(
+        "GEMINI_EMBEDDING_MODEL", _DEFAULT_EMBEDDING_MODEL
+    )
+    knowledge_top_k: int = int(os.environ.get("KNOWLEDGE_TOP_K", "3"))
 
     def resolved_api_key(self) -> str:
         return os.environ.get(self.api_key_env, "")

@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import importlib
+import logging
 import socket
 import struct
 import time
@@ -45,6 +46,7 @@ with warnings.catch_warnings():
     import audioop
 
 _SAMPLE_WIDTH_BYTES = 2  # PCM16 throughout this module
+_LOG = logging.getLogger("robot_audio")
 
 # -- mic ---------------------------------------------------------------
 
@@ -212,7 +214,17 @@ class RobotSpeaker:
                 chunk = converted[offset : offset + _CHUNK_BYTES]
                 await self._pace_wait_for_next_slot()
                 # DDS RPC — off-loop so a hung call can't freeze the runner.
-                await asyncio.to_thread(client.PlayStream, self.app_name, self._stream_id, chunk)
+                result = await asyncio.to_thread(
+                    client.PlayStream, self.app_name, self._stream_id, chunk
+                )
+                # PlayStream returns (code, data) like the rest of this RPC
+                # client; a non-zero code means the vendor side rejected or
+                # dropped this chunk (e.g. a stale stream_id from a prior
+                # session) — silently discarding it, as the ported code did,
+                # made "robot stopped talking" undiagnosable from the log.
+                code = result[0] if isinstance(result, tuple) else result
+                if code:
+                    _LOG.warning("PlayStream non-zero result: %r", result)
 
     def _resample(self, pcm: bytes, sample_rate_hz: int) -> bytes:
         if sample_rate_hz == _G1_SAMPLE_RATE:
@@ -233,9 +245,12 @@ class RobotSpeaker:
             if self._client is None:
                 return
             with contextlib.suppress(Exception):
-                await asyncio.wait_for(
+                stop_result = await asyncio.wait_for(
                     asyncio.to_thread(self._client.PlayStop, self.app_name), timeout=5.0
                 )
+                code = stop_result[0] if isinstance(stop_result, tuple) else stop_result
+                if code:
+                    _LOG.warning("PlayStop non-zero result: %r", stop_result)
             self._next_send_monotonic = time.monotonic()
 
     async def _pace_wait_for_next_slot(self) -> None:

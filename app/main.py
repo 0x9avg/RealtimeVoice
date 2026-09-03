@@ -27,8 +27,9 @@ from app.gemini_live import (
     Transcript,
     TurnComplete,
 )
+from app.knowledge import knowledge_base
 from app.robot_audio import HalfDuplexGate, RobotMic, RobotSpeaker
-from app.tools import ControlVideoWallTool, GetCurrentTimeTool, ToolRegistry
+from app.tools import ControlVideoWallTool, GetCurrentTimeTool, SearchKnowledgeTool, ToolRegistry
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 _LOG = logging.getLogger("prototype")
@@ -47,6 +48,9 @@ def build_tool_registry() -> ToolRegistry:
             token=settings.wall_agent_token,
             timeout_s=settings.wall_agent_timeout_s,
         )
+    )
+    registry.register(
+        SearchKnowledgeTool(knowledge=knowledge_base, top_k=settings.knowledge_top_k)
     )
     return registry
 

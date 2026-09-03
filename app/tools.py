@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
+from app.knowledge import KnowledgeBase
 from app.wall.commands import WallCategory, WallCommand, WallCommandKind, WallCommandOutcome
 
 
@@ -261,3 +262,54 @@ class ControlVideoWallTool:
         if outcome == WallCommandOutcome.UNREACHABLE.value:
             return ToolResult(ok=False, text="the video wall is not reachable right now")
         return ToolResult(ok=False, text=f"the wall rejected this command: {detail or outcome}")
+
+
+@dataclass(frozen=True, slots=True)
+class SearchKnowledgeTool:
+    """RAG over app/knowledge.py's `KnowledgeBase` — drop .txt/.md files into
+    the configured directory and this tool finds relevant passages in them.
+
+    Re-indexes (cheaply — see KnowledgeBase.ensure_fresh) on every call, so
+    dropping a new file in takes effect on the next question, no restart.
+    """
+
+    knowledge: KnowledgeBase
+    top_k: int
+    name: str = "search_knowledge"
+    description: str = (
+        "Search the uploaded reference documents for this venue — facts, "
+        "procedures, names, numbers, anything specific to this place. Call "
+        "this BEFORE answering any question that might be covered by those "
+        "documents; your own general knowledge is not about this place. "
+        "Returns the most relevant excerpts, or says nothing was found — if "
+        "so, tell the person honestly instead of guessing."
+    )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "OBJECT",
+            "properties": {
+                "question": {
+                    "type": "STRING",
+                    "description": "The question, in the visitor's own words.",
+                }
+            },
+            "required": ["question"],
+        }
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        question = str(args.get("question", "")).strip()
+        if not question:
+            return ToolResult(ok=False, text="no question was given")
+        try:
+            await self.knowledge.ensure_fresh()
+            results = await self.knowledge.search(question, top_k=self.top_k)
+        except httpx.HTTPError as exc:
+            return ToolResult(ok=False, text=f"knowledge search is unavailable right now: {exc}")
+        if not results:
+            return ToolResult(
+                ok=False, text="nothing in the uploaded documents answers that"
+            )
+        excerpts = "\n\n".join(f"[{r.source}]\n{r.text}" for r in results)
+        return ToolResult(ok=True, text=excerpts)
