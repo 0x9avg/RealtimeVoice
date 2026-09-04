@@ -178,6 +178,25 @@ class VisitIntake:
     def engaged(self) -> bool:
         return self._step >= 0
 
+    @property
+    def current_question(self) -> str:
+        """The line the visitor is currently expected to answer.
+
+        Used to put the model back on script after the Gemini session is
+        recreated mid-interview (see app/session_hub.py) — the machine's own
+        state survives a reconnect, but the model's memory of being
+        mid-interview does not, so it has to be told where it left off.
+        """
+        if not self.engaged:
+            return ""
+        if self._step == 0:
+            return _LANGUAGE_PROMPT
+        steps = _STEPS[self._language]
+        field_index = self._step - 1
+        if field_index >= len(steps):
+            return self._confirmation_question()
+        return steps[field_index][1]
+
     def start(self) -> str:
         self._card = {}
         self._step = 0

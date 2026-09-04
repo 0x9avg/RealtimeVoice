@@ -91,11 +91,56 @@ _G1_GREETING_LANGUAGE_RULE = (
     "вопрос повторно не задавай."
 )
 
+# Gemini Live holds the model's turn silent while a tool call is in flight
+# (app/session_hub.py's _run_tool awaits it before the model can say
+# anything else) — search_knowledge/search_guard_kb embed+search, and
+# control_video_wall/visit_intake hit a network agent, so this can be a
+# real, human-noticeable pause (up to TOOL_TIMEOUT_S, 8s by default). Nothing
+# in this codebase can safely speak FOR the model mid-tool-call (see
+# app/gemini_live.py — injecting a new clientContent turn while a
+# functionCall response is still pending isn't a documented, safe operation
+# against this protocol), so the only lever is asking the model itself to
+# say something short BEFORE it calls a tool it knows might take a moment —
+# a native audio Live model can emit a spoken phrase and the functionCall in
+# the same turn. This is a prompt-level ask, not a guarantee enforced by
+# code: if it turns out unreliable in practice, the next step would be a
+# locally-played canned filler clip instead (see app/session_hub.py's
+# ToolCall handling, which already broadcasts a "thinking" status the web UI
+# can show regardless of whether the model complies).
+_TOOL_LATENCY_RULE = (
+    "ПАУЗЫ НА ИНСТРУМЕНТЫ: прежде чем вызвать инструмент, который может "
+    "занять заметное время (поиск по базе, управление видеостеной, "
+    "оформление визита), сначала коротко вслух скажи, что сейчас "
+    "проверишь/уточнишь это — одной короткой фразой вроде «Секунду, "
+    "уточню» или «Сейчас проверю» на языке разговора — и только потом "
+    "вызывай инструмент. Не молчи в ожидании результата инструмента. Для "
+    "мгновенных действий (например текущее время) эта фраза не нужна."
+)
+
 _R1_TOOL_RULES = (
     "ИНСТРУМЕНТЫ: для управления видеостеной используй control_video_wall "
     "и никогда не утверждай, что переключение произошло, если инструмент "
     "этого не подтвердил. Для любого фактического вопроса о разделах — "
     "сначала search_knowledge, потом ответ только по найденному."
+    f" {_TOOL_LATENCY_RULE}"
+)
+
+# app/session_hub.py sends this (with the pending question appended) after
+# the Gemini session is recreated while a visit interview is still running.
+# The interview's own state lives in Python (app/visit_intake.py) and
+# survives any reconnect — the MODEL's memory of being mid-interview does
+# not, and without this it would treat the visitor's next answer as small
+# talk and never call visit_intake again, stranding the registration.
+INTAKE_RESUME_MARKER = "[SYSTEM] Оформление визита продолжается. Последний заданный вопрос:"
+
+_G1_INTAKE_RESUME_RULE = (
+    f'ВОССТАНОВЛЕНИЕ ОПРОСА: если получишь реплику, начинающуюся с «{INTAKE_RESUME_MARKER}» — '
+    "это не слова человека, а служебное напоминание о том, что опрос визита уже идёт и "
+    "прервался по технической причине. После этой пометки идёт вопрос, на который посетитель "
+    "ещё не ответил. Извинись одной короткой фразой за паузу, повтори этот вопрос почти "
+    "дословно и дальше продолжай как обычно: на каждый ответ посетителя вызывай visit_intake "
+    "с action='answer'. НЕ вызывай action='start' — опрос уже начат, и повторный старт сотрёт "
+    "всё, что посетитель уже назвал. Никогда не произноси саму пометку."
 )
 
 _G1_TOOL_RULES = (
@@ -120,22 +165,21 @@ _G1_TOOL_RULES = (
     "search_guard_kb и отвечай только по найденному; если инструмент "
     "говорит, что ответа нет, — так и скажи и предложи обратиться к "
     "охраннику."
+    f" {_TOOL_LATENCY_RULE}"
 )
 
-_PROFILES: dict[str, tuple[str, str, str]] = {
-    "r1": (_R1_SCOPE, _R1_TOOL_RULES, ""),
-    "g1": (_G1_SCOPE, _G1_TOOL_RULES, _G1_GREETING_LANGUAGE_RULE),
+# (scope, tool_rules, profile-specific extra rules appended after the shared
+# ones — empty tuple for a profile that needs none).
+_PROFILES: dict[str, tuple[str, str, tuple[str, ...]]] = {
+    "r1": (_R1_SCOPE, _R1_TOOL_RULES, ()),
+    "g1": (_G1_SCOPE, _G1_TOOL_RULES, (_G1_GREETING_LANGUAGE_RULE, _G1_INTAKE_RESUME_RULE)),
 }
 
 
 def build_system_instruction(profile: str) -> str:
     try:
-        scope, tool_rules, greeting_rule = _PROFILES[profile]
+        scope, tool_rules, extra_rules = _PROFILES[profile]
     except KeyError as exc:
         msg = f"unknown robot_profile {profile!r}, expected one of {sorted(_PROFILES)}"
         raise ValueError(msg) from exc
-    parts = [scope, _LANGUAGE_RULE, _PRESENCE_RULE]
-    if greeting_rule:
-        parts.append(greeting_rule)
-    parts.append(tool_rules)
-    return "\n\n".join(parts)
+    return "\n\n".join([scope, _LANGUAGE_RULE, _PRESENCE_RULE, *extra_rules, tool_rules])

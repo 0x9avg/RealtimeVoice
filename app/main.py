@@ -15,9 +15,9 @@ in both directions; JSON text frames carry control/status messages. See
 
 from __future__ import annotations
 
-import hmac
 import json
 import logging
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
@@ -27,13 +27,41 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api_routes import router as api_router
+from app.auth import token_matches
 from app.config import settings
 from app.session_hub import SessionHub
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 _LOG = logging.getLogger("realtimevoice")
 
-_WEB_DIR = Path(__file__).resolve().parent.parent / "web"
+_TOKEN_IN_URL_RE = re.compile(r"(token=)[^&\s\"']+")
+
+
+class _RedactTokenFilter(logging.Filter):
+    """Keep ACCESS_TOKEN out of the logs.
+
+    `/ws/session` and `/api/camera/*` take the token as a query parameter
+    (a browser WebSocket/<img> can't send an Authorization header), and
+    uvicorn's access log writes the full request line — so every operator
+    connection was printing a working credential into journald verbatim,
+    where anyone with shell access or a copy of the logs could lift it.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.args:
+            record.args = tuple(
+                _TOKEN_IN_URL_RE.sub(r"\1<redacted>", a) if isinstance(a, str) else a
+                for a in (record.args if isinstance(record.args, tuple) else (record.args,))
+            )
+        if isinstance(record.msg, str):
+            record.msg = _TOKEN_IN_URL_RE.sub(r"\1<redacted>", record.msg)
+        return True
+
+
+for _name in ("uvicorn.access", "uvicorn.error", "realtimevoice"):
+    logging.getLogger(_name).addFilter(_RedactTokenFilter())
+
+_WEB_DIR = (Path(__file__).resolve().parent.parent / "web").resolve()
 
 session_hub = SessionHub(settings)
 
@@ -65,9 +93,9 @@ async def session(ws: WebSocket) -> None:
     # — without ever touching the UI. Close with a distinct 4401 code so
     # the browser side (useVoiceSession.ts) can tell "wrong/missing token"
     # apart from an ordinary disconnect and prompt for one.
-    # hmac.compare_digest, not != — see app/auth.py's require_token for why
-    # a plain string comparison is a timing side channel.
-    if settings.access_token and not hmac.compare_digest(
+    # token_matches (app/auth.py), not != — constant-time, and safe against
+    # the non-ASCII input that would otherwise crash this handler.
+    if settings.access_token and not token_matches(
         ws.query_params.get("token", ""), settings.access_token
     ):
         await ws.close(code=4401, reason="unauthorized")
@@ -101,7 +129,7 @@ async def session(ws: WebSocket) -> None:
                 await session_hub.handle_text(str(payload.get("text", "")))
             elif payload.get("type") == "mic_source":
                 source = str(payload.get("source", "none"))
-                if source in ("browser", "robot", "none"):
+                if source in ("browser", "robot", "usb", "none"):
                     mic_source = source
                     await session_hub.handle_mic_source(source)
             elif payload.get("type") == "mute":
@@ -121,8 +149,21 @@ async def spa_fallback(full_path: str) -> FileResponse:
     /api/* router above; falls back to index.html for anything that isn't a
     real static asset (e.g. capture-worklet.js, served from web-src/public/
     verbatim by the Vite build).
+
+    The resolve()+relative_to() containment check is load-bearing, not
+    defensive dressing: `_WEB_DIR / full_path` alone happily walks out of
+    web/ when the path contains `..` (percent-encoded `..%2f` survives
+    routing and lands in `full_path` verbatim), which turned this route
+    into an unauthenticated "read any file the process can read" endpoint —
+    `.env` (API key + ACCESS_TOKEN) included. resolve() also collapses
+    symlinks, so a link inside web/ can't point out either.
     """
-    candidate = _WEB_DIR / full_path
-    if full_path and candidate.is_file():
+    index = _WEB_DIR / "index.html"
+    if not full_path:
+        return FileResponse(index)
+    candidate = (_WEB_DIR / full_path).resolve()
+    if not candidate.is_relative_to(_WEB_DIR):
+        return FileResponse(index)
+    if candidate.is_file():
         return FileResponse(candidate)
-    return FileResponse(_WEB_DIR / "index.html")
+    return FileResponse(index)

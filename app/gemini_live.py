@@ -18,8 +18,9 @@ import asyncio
 import base64
 import contextlib
 import json
+import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
@@ -28,6 +29,8 @@ from websockets.asyncio.client import ClientConnection
 
 from app.config import Settings
 from app.tools import ToolRegistry
+
+_LOG = logging.getLogger("gemini_live")
 
 # --------------------------------------------------------------------------
 # Events yielded by a RealtimeAdapter
@@ -121,6 +124,11 @@ class GeminiLiveAdapter:
 
     settings: Settings
     tools: ToolRegistry
+    # Asked before a PROACTIVE session swap (never before a forced
+    # reconnect — that isn't ours to postpone). Returning False defers the
+    # swap to a later turn: app/session_hub.py uses it to avoid dropping a
+    # fresh session on top of a half-finished visit interview.
+    refresh_guard: Callable[[], bool] | None = None
     _ws: ClientConnection | None = field(default=None, init=False, repr=False)
     _send_queue: asyncio.Queue[dict[str, Any]] = field(
         default_factory=asyncio.Queue, init=False, repr=False
@@ -197,6 +205,7 @@ class GeminiLiveAdapter:
                             isinstance(event, TurnComplete)
                             and time.monotonic() - session_opened
                             >= self.settings.max_session_duration_s
+                            and (self.refresh_guard is None or self.refresh_guard())
                         ):
                             proactive_refresh = True
                             break
@@ -269,19 +278,43 @@ class GeminiLiveAdapter:
         return speech
 
     async def _send_tool_response(self, call_id: str, name: str, result: str) -> None:
-        if self._ws is None:
-            return
-        await self._ws.send(
-            json.dumps(
-                {
-                    "toolResponse": {
-                        "functionResponses": [
-                            {"id": call_id, "name": name, "response": {"result": result}}
-                        ]
-                    }
-                }
+        """Deliver a tool result, or say loudly why it couldn't be.
+
+        The model blocks its turn waiting for this message, so a silently
+        dropped response is the robot going mute mid-answer with nothing in
+        the log to explain it. That's what used to happen whenever the
+        socket flipped between the toolCall arriving and the result being
+        ready (a reconnect, or Gemini closing a long session): `if
+        self._ws is None: return`, no trace. The turn is unrecoverable
+        either way — a reconnect starts a fresh session — but it must be
+        diagnosable, so this logs instead of swallowing.
+        """
+        ws = self._ws
+        if ws is None:
+            _LOG.warning(
+                "gemini.tool_response_undeliverable name=%s call_id=%s reason=no_connection",
+                name,
+                call_id,
             )
+            return
+        payload = json.dumps(
+            {
+                "toolResponse": {
+                    "functionResponses": [
+                        {"id": call_id, "name": name, "response": {"result": result}}
+                    ]
+                }
+            }
         )
+        try:
+            await ws.send(payload)
+        except Exception as exc:  # noqa: BLE001 — connection died mid-send
+            _LOG.warning(
+                "gemini.tool_response_undeliverable name=%s call_id=%s reason=%s",
+                name,
+                call_id,
+                exc,
+            )
 
     async def _pump(self, ws: ClientConnection) -> AsyncIterator[LiveEvent]:
         """Drain the outbound queue and the inbound socket concurrently."""

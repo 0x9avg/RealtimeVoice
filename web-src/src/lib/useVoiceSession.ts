@@ -14,18 +14,58 @@ export interface TranscriptLine {
   text: string;
 }
 
-export type MicSource = "browser" | "robot" | "none";
+export type MicSource = "browser" | "robot" | "usb" | "none";
+
+// Persists only the DROPDOWN pick ("browser"/"robot"/"usb"), not whether the
+// mic is actually active. The active hardware mic itself is already global
+// and restored from the server on every connect (app/session_hub.py's
+// capabilities message, mirrored below) — this is only for the case that
+// isn't: picking an option in the dropdown but not pressing Start, which had
+// nothing backing it server-side and silently reverted to "Микрофон
+// браузера" on every reload.
+const _MIC_SOURCE_STORAGE_KEY = "realtimevoice.micSource";
+
+function readStoredMicSource(): MicSource {
+  try {
+    const stored = localStorage.getItem(_MIC_SOURCE_STORAGE_KEY);
+    if (stored === "browser" || stored === "robot" || stored === "usb") return stored;
+  } catch {
+    // localStorage unavailable (private mode, blocked site data) — fall
+    // back to the default below, same as a first-ever visit.
+  }
+  return "browser";
+}
+
+function persistMicSource(source: MicSource): void {
+  try {
+    // "none" is a wire-only value (see stopMic) — never a dropdown option,
+    // so there's nothing meaningful to remember for it.
+    if (source === "none") return;
+    localStorage.setItem(_MIC_SOURCE_STORAGE_KEY, source);
+  } catch {
+    // Same as above — a lost preference is a minor inconvenience, not
+    // worth surfacing to the user.
+  }
+}
 
 export function useVoiceSession() {
   const [status, setStatus] = useState("idle");
   const [micActive, setMicActive] = useState(false);
-  const [micSource, setMicSourceState] = useState<MicSource>("browser");
+  const [micSource, setMicSourceState] = useState<MicSource>(readStoredMicSource);
   const [robotMicAvailable, setRobotMicAvailable] = useState(false);
+  const [usbMicAvailable, setUsbMicAvailable] = useState(false);
   const [transcript, setTranscript] = useState<TranscriptLine[]>([]);
   const [toolLog, setToolLog] = useState<string[]>([]);
 
   const wsRef = useRef<WebSocket | null>(null);
-  const micSourceRef = useRef<MicSource>("browser");
+  // Mirrors `micActive` state for use inside ws.onmessage (see the mount
+  // effect below): that handler is created once, inside a `useEffect(...,
+  // [])`, so any REACT STATE it reads is permanently the value from the
+  // first render (a stale closure) — it must read refs instead for
+  // anything that can change later. Same reason micSourceRef exists
+  // alongside micSource.
+  const micActiveRef = useRef(false);
+  const micSourceRef = useRef<MicSource>(readStoredMicSource());
   const captureCtxRef = useRef<AudioContext | null>(null);
   const captureNodeRef = useRef<AudioWorkletNode | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
@@ -91,10 +131,11 @@ export function useVoiceSession() {
     }
   }, []);
 
-  const listeningLabel = useCallback(
-    () => (micSourceRef.current === "robot" ? "listening (robot mic)" : "listening"),
-    [],
-  );
+  const listeningLabel = useCallback(() => {
+    if (micSourceRef.current === "robot") return "listening (robot mic)";
+    if (micSourceRef.current === "usb") return "listening (usb mic)";
+    return "listening";
+  }, []);
 
   useEffect(() => {
     const protocol = location.protocol === "https:" ? "wss" : "ws";
@@ -118,35 +159,86 @@ export function useVoiceSession() {
       }
       const message = JSON.parse(event.data);
       switch (message.type) {
-        case "capabilities":
+        case "capabilities": {
           setRobotMicAvailable(Boolean(message.robot_mic));
+          setUsbMicAvailable(Boolean(message.usb_mic));
           if (!message.robot_mic && micSourceRef.current === "robot") {
             micSourceRef.current = "browser";
             setMicSourceState("browser");
+            persistMicSource("browser");
           }
-          // The robot mic is a GLOBAL switch (app/robot_mic_state.py on the
-          // server) — a previous tab/operator may have already turned it
-          // on, and this fresh connection must reflect that instead of
-          // showing "off" and requiring a redundant Start click. Nothing to
-          // capture locally for this case (the server reads the robot's own
-          // hardware mic), so just mirror the UI state.
-          if (message.robot_mic && message.robot_mic_active) {
-            micSourceRef.current = "robot";
-            setMicSourceState("robot");
+          if (!message.usb_mic && micSourceRef.current === "usb") {
+            micSourceRef.current = "browser";
+            setMicSourceState("browser");
+            persistMicSource("browser");
+          }
+          // Any hardware mic is a GLOBAL switch (app/robot_mic_state.py on
+          // the server, shared across robot/usb) — a previous tab/operator
+          // may have already turned one on, and this fresh connection must
+          // reflect that instead of showing "off" and requiring a redundant
+          // Start click. Nothing to capture locally for this case (the
+          // server reads the actual hardware), so just mirror the UI state.
+          const activeHwSource = message.robot_mic && message.robot_mic_active
+            ? "robot"
+            : message.usb_mic && message.usb_mic_active
+              ? "usb"
+              : null;
+          if (activeHwSource) {
+            micSourceRef.current = activeHwSource;
+            setMicSourceState(activeHwSource);
+            persistMicSource(activeHwSource);
+            micActiveRef.current = true;
             setMicActive(true);
-            setStatus("listening (robot mic)");
+            setStatus(activeHwSource === "robot" ? "listening (robot mic)" : "listening (usb mic)");
+          } else if (
+            micActiveRef.current &&
+            (micSourceRef.current === "robot" || micSourceRef.current === "usb")
+          ) {
+            // This tab was ACTIVELY mirroring a hardware mic (micActiveRef,
+            // not just the dropdown pick — see its declaration above) that
+            // JUST got switched off (or to a different source) from
+            // somewhere else. This is a LIVE update (app/session_hub.py's
+            // handle_mic_source now broadcasts it, not just delivers it on
+            // join), not only the initial capabilities on connect. Without
+            // this, a tab kept showing "listening (robot mic)" forever
+            // after another operator turned it off, even though the server
+            // had already stopped forwarding that audio.
+            //
+            // The micActiveRef check matters even though it looks
+            // redundant with the condition above: on a freshly loaded page,
+            // micSourceRef can already be "robot"/"usb" merely because it
+            // was RESTORED from localStorage (the user had it selected, but
+            // never actually pressed Start) — without gating on
+            // micActiveRef too, this branch used to fire for that case as
+            // well and immediately stomp the just-restored selection back
+            // to "browser", which is what made mic-source selection look
+            // like it kept resetting on every page reload.
+            micSourceRef.current = "browser";
+            setMicSourceState("browser");
+            persistMicSource("browser");
+            micActiveRef.current = false;
+            setMicActive(false);
+            setStatus("idle");
           }
           break;
+        }
         case "status":
           setStatus(message.state);
           if (message.detail) appendTool(`[status] ${message.state}: ${message.detail}`);
           break;
         case "turn_complete":
-          setStatus(micActive ? listeningLabel() : "idle");
+          // micActiveRef, not the micActive STATE — this handler lives
+          // inside the mount effect's closure (see micActiveRef's
+          // declaration), so the state value here would always be
+          // whatever it was on the very first render (false), permanently
+          // — every turn_complete after the mic was first started would
+          // read as "not listening" and drop the status back to "idle"
+          // instead of back to "listening" between turns.
+          setStatus(micActiveRef.current ? listeningLabel() : "idle");
           break;
         case "interrupted":
           stopPlayback();
-          setStatus(micActive ? listeningLabel() : "idle");
+          setStatus(micActiveRef.current ? listeningLabel() : "idle");
           break;
         case "transcript":
           setTranscript((prev) => [...prev, { role: message.role, text: message.text }]);
@@ -213,11 +305,13 @@ export function useVoiceSession() {
     const source = micSourceRef.current;
     if (source === "browser") await startBrowserMic();
     sendMicSourceMessage(source);
+    micActiveRef.current = true;
     setMicActive(true);
-    setStatus(source === "robot" ? "listening (robot mic)" : "listening");
-  }, [startBrowserMic, sendMicSourceMessage]);
+    setStatus(listeningLabel());
+  }, [startBrowserMic, sendMicSourceMessage, listeningLabel]);
 
   const stopMic = useCallback(() => {
+    micActiveRef.current = false;
     setMicActive(false);
     stopBrowserMic();
     sendMicSourceMessage("none");
@@ -227,6 +321,7 @@ export function useVoiceSession() {
   const setMicSource = useCallback((source: MicSource) => {
     micSourceRef.current = source;
     setMicSourceState(source);
+    persistMicSource(source);
   }, []);
 
   const mute = useCallback(() => {
@@ -264,6 +359,7 @@ export function useVoiceSession() {
     micSource,
     setMicSource,
     robotMicAvailable,
+    usbMicAvailable,
     transcript,
     toolLog,
     startMic,

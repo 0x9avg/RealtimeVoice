@@ -147,6 +147,132 @@ class RobotMic:
         return bytes(out)
 
 
+# -- usb mic (external USB mic/speakerphone, e.g. a conference mic plugged
+# into the robot's own onboard computer) ---------------------------------
+
+
+class UsbMicNotAvailableError(RuntimeError):
+    """Raised when `UsbMic` can't launch `arecord` for its configured device."""
+
+
+@dataclass(slots=True)
+class UsbMic:
+    """Reads a USB microphone plugged into the robot's own computer via ALSA.
+
+    Unlike `RobotMic` (the head-mic array, reached over UDP multicast —
+    vendor hardware, vendor protocol), this is any standard USB audio input
+    device (e.g. a USB conference speakerphone) that Linux's own ALSA layer
+    already sees as a normal sound card — no vendor SDK involved. Captured
+    by shelling out to `arecord` (already present on the robot as part of
+    alsa-utils) rather than a Python ALSA/PortAudio binding, so this needs
+    no extra dependency beyond what the OS already ships. Confirmed live
+    against a Jabra Speak2 40 MS on this R1 (04.09.2026): `arecord -D
+    hw:MS,0 -f S16_LE -r 16000 -c 1` records real (non-silent) mono 16kHz
+    audio directly — no resampling needed downstream, same contract as
+    `RobotMic.stream()`.
+
+    `alsa_device` should name the card by its ALSA-assigned ID (e.g.
+    "hw:MS,0" for a card listed as "MS" in `arecord -l`/`/proc/asound/
+    cards`), not by numeric index ("hw:2,0") — the index can shift if other
+    USB audio devices are plugged in later or enumerate in a different
+    order after reboot; the ID string does not.
+    """
+
+    alsa_device: str
+    sample_rate_hz: int = 16_000
+    chunk_ms: int = 50
+    _proc: asyncio.subprocess.Process | None = field(default=None, init=False, repr=False)
+    _closed: bool = field(default=False, init=False)
+
+    async def stream(self) -> AsyncIterator[bytes]:
+        """Yield mono PCM16 `sample_rate_hz` chunks for as long as `arecord` runs.
+
+        Returns (does not raise) if `arecord` exits or the device disappears
+        mid-stream — the caller (`SessionHub._usb_mic_task`, wrapped by
+        `_supervised`) treats a returning stream as "this source stopped",
+        not as a crash, so an unplugged mic doesn't take the whole process
+        down with it.
+        """
+        chunk_bytes = self.sample_rate_hz * _SAMPLE_WIDTH_BYTES * self.chunk_ms // 1000
+        try:
+            self._proc = await asyncio.create_subprocess_exec(
+                "arecord",
+                "-D",
+                self.alsa_device,
+                "-f",
+                "S16_LE",
+                "-r",
+                str(self.sample_rate_hz),
+                "-c",
+                "1",
+                "-t",
+                "raw",
+                "-q",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError as exc:
+            raise UsbMicNotAvailableError(
+                "arecord not found on PATH — install alsa-utils"
+            ) from exc
+        proc = self._proc
+        assert proc.stdout is not None  # noqa: S101 — PIPE requested above
+        try:
+            while not self._closed:
+                try:
+                    data = await proc.stdout.readexactly(chunk_bytes)
+                except asyncio.IncompleteReadError:
+                    if not self._closed:
+                        stderr = b""
+                        if proc.stderr is not None:
+                            with contextlib.suppress(Exception):
+                                stderr = await proc.stderr.read()
+                        _LOG.warning(
+                            "usb_mic.arecord_exited device=%s detail=%s",
+                            self.alsa_device,
+                            stderr.decode("utf-8", "replace").strip() or "(no output)",
+                        )
+                    return
+                yield data
+        finally:
+            await self._terminate()
+
+    async def close(self) -> None:
+        self._closed = True
+        await self._terminate()
+
+    async def _terminate(self) -> None:
+        if self._proc is None:
+            return
+        proc = self._proc
+        # Cleared up front, not after wait() below — a concurrent call (e.g.
+        # close() racing stream()'s own finally-block cleanup) must see this
+        # as already-handled rather than issuing a second terminate()/kill()
+        # against the same (possibly already-reaped) PID.
+        self._proc = None
+        with contextlib.suppress(ProcessLookupError):
+            proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=2.0)
+            return
+        except TimeoutError:
+            pass
+        # SIGTERM ignored/stuck (observed elsewhere in this project with
+        # blocking vendor calls — see ../DEPLOYMENT.md's "Процесс не отвечает
+        # на systemctl stop"). Left alone, `arecord` keeps the ALSA device
+        # open indefinitely — every future UsbMic.stream() attempt would then
+        # fail to open the same hw: device as "busy", with no obvious cause.
+        # systemd escalates the same way (TimeoutStopSec) for the main
+        # process; do it ourselves here since this is OUR child process, not
+        # something systemd's cgroup kill is guaranteed to reach in every
+        # supervision context (e.g. a bare `uv run` with no systemd unit).
+        _LOG.warning("usb_mic.sigterm_ignored device=%s escalating_to_sigkill", self.alsa_device)
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(proc.wait(), timeout=2.0)
+
+
 # -- speaker -------------------------------------------------------------
 
 _G1_SAMPLE_RATE = 16_000
@@ -184,6 +310,8 @@ class RobotSpeaker:
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
     _resample_state: Any = field(default=None, init=False)
     _resample_src_rate: int = field(default=0, init=False)
+    # Bumped by stop() to cut an in-flight play() short — see both methods.
+    _epoch: int = field(default=0, init=False)
 
     def _ensure_client(self) -> Any:
         if self._client is not None:
@@ -199,6 +327,21 @@ class RobotSpeaker:
         self._next_send_monotonic = time.monotonic()
         return client
 
+    async def warm_up(self) -> None:
+        """Open the vendor audio client ahead of the first utterance.
+
+        `_ensure_client()` runs DDS discovery and `AudioClient.Init()` (a
+        10s SetTimeout), which otherwise all lands on the FIRST thing the
+        robot ever says — i.e. on the first visitor, who gets to wait
+        through it. Failures are logged and ignored: this is an
+        optimisation, and play() will retry the same path anyway.
+        """
+        try:
+            await asyncio.to_thread(self._ensure_client)
+            _LOG.info("robot_speaker.warmed_up")
+        except Exception as exc:  # noqa: BLE001 — best effort only
+            _LOG.warning("robot_speaker.warm_up_failed: %s", exc)
+
     async def play(self, pcm: bytes, *, sample_rate_hz: int) -> None:
         """Resample to 16kHz mono, chunk to 50ms, pace and send."""
         converted = self._resample(pcm, sample_rate_hz)
@@ -212,10 +355,18 @@ class RobotSpeaker:
             # with no server-side error, since nothing raised — it just never
             # got to run anything else while blocked.
             client = await asyncio.to_thread(self._ensure_client)
+            epoch = self._epoch
             now = time.monotonic()
             if self._next_send_monotonic <= now:
                 self._next_send_monotonic = now - _LEAD_S
             for offset in range(0, len(converted), _CHUNK_BYTES):
+                # A stop() landed while this call was pacing (barge-in, or
+                # the operator's "Замолчи"). Bail at the chunk boundary
+                # instead of playing the rest of an utterance nobody wants
+                # to hear — without this, silencing the robot takes as long
+                # as whatever audio is already in flight.
+                if self._epoch != epoch:
+                    return
                 chunk = converted[offset : offset + _CHUNK_BYTES]
                 await self._pace_wait_for_next_slot()
                 # DDS RPC — off-loop so a hung call can't freeze the runner.
@@ -253,6 +404,10 @@ class RobotSpeaker:
         _stream_id here (not just clearing playback state) forces the next
         play() to start what the vendor sees as a brand-new stream.
         """
+        # Signal BEFORE taking the lock: a play() that's mid-utterance holds
+        # it and only releases between paced chunks, so waiting for the lock
+        # first would mean waiting out the audio we're trying to cut off.
+        self._epoch += 1
         async with self._lock:
             self._resample_state = None
             self._resample_src_rate = 0
@@ -298,6 +453,16 @@ class HalfDuplexGate:
     def on_speaking_stopped(self) -> None:
         self._speaking = False
         self._guard_until = time.monotonic() + self._guard_s
+
+    def open_now(self) -> None:
+        """Re-open the mic with no guard interval.
+
+        For a barge-in: the mic is picking up the visitor (that's what
+        caused the interrupt), so the usual "don't hear our own tail"
+        margin would only throw away the start of their sentence.
+        """
+        self._speaking = False
+        self._guard_until = 0.0
 
     @property
     def mic_muted(self) -> bool:

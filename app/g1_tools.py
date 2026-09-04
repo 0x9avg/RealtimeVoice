@@ -155,6 +155,19 @@ class VisitIntakeTool:
     )
 
     @property
+    def engaged(self) -> bool:
+        """Whether an interview is in progress right now — read by
+        app/session_hub.py to keep a Gemini session swap from stranding a
+        half-finished registration."""
+        return self._intake.engaged
+
+    @property
+    def current_question(self) -> str:
+        """The question the visitor still owes an answer to (empty when no
+        interview is running)."""
+        return self._intake.current_question
+
+    @property
     def parameters(self) -> dict[str, Any]:
         return {
             "type": "OBJECT",

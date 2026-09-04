@@ -17,6 +17,7 @@ export function HomePage() {
     micSource,
     setMicSource,
     robotMicAvailable,
+    usbMicAvailable,
     transcript,
     toolLog,
     startMic,
@@ -40,13 +41,16 @@ export function HomePage() {
       <div className="flex flex-wrap items-center gap-2">
         <select
           value={micSource}
-          onChange={(e) => setMicSource(e.target.value as "browser" | "robot")}
+          onChange={(e) => setMicSource(e.target.value as "browser" | "robot" | "usb")}
           disabled={micActive}
           className="rounded-md border border-border bg-background/60 px-2 py-1.5 text-sm disabled:opacity-50"
         >
           <option value="browser">Микрофон браузера</option>
           <option value="robot" disabled={!robotMicAvailable}>
             Встроенный (робот)
+          </option>
+          <option value="usb" disabled={!usbMicAvailable}>
+            Внешний (USB)
           </option>
         </select>
         <button

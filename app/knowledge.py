@@ -26,6 +26,9 @@ _LOG = logging.getLogger("knowledge")
 
 _SUPPORTED_SUFFIXES = (".txt", ".md")
 _CACHE_FILENAME = ".embeddings_cache.json"
+
+# Cap on the in-memory query-embedding cache (see KnowledgeBase._query_cache).
+_QUERY_CACHE_MAX = 256
 # Paragraph-ish chunking: split on blank lines, then pack paragraphs back
 # together up to this size so a chunk is neither one sentence nor a whole
 # file. No tokenizer — character count is a good enough proxy here.
@@ -95,6 +98,16 @@ class KnowledgeBase:
     _indexed_signature: tuple[tuple[str, float], ...] = field(
         default=(), init=False, repr=False
     )
+    # One HTTP client for the life of the process instead of a fresh one per
+    # question: every search() used to pay a new TCP+TLS handshake to Google
+    # before it could even ask for the query embedding, on a robot Wi-Fi
+    # link, while the visitor waited.
+    _http: Any = field(default=None, init=False, repr=False)
+    # Query embeddings, in memory only — visitors ask the same handful of
+    # things all day, and a repeat question then costs no network at all.
+    # Deliberately NOT written to the on-disk chunk cache: that one is keyed
+    # to knowledge content, and visitor questions would grow it forever.
+    _query_cache: dict[str, list[float]] = field(default_factory=dict, init=False, repr=False)
 
     def _cache_path(self) -> Path:
         return self.directory / _CACHE_FILENAME
@@ -169,7 +182,14 @@ class KnowledgeBase:
     async def search(self, query: str, *, top_k: int) -> list[SearchResult]:
         if not self._chunks:
             return []
-        query_vec = (await self._embed_batch([query]))[0]
+        cached = self._query_cache.get(query)
+        if cached is not None:
+            query_vec = cached
+        else:
+            query_vec = (await self._embed_batch([query]))[0]
+            if len(self._query_cache) >= _QUERY_CACHE_MAX:
+                self._query_cache.pop(next(iter(self._query_cache)))
+            self._query_cache[query] = query_vec
         scored = [
             SearchResult(source=c.source, text=c.text, score=_cosine(query_vec, c.embedding))
             for c in self._chunks
@@ -185,10 +205,11 @@ class KnowledgeBase:
         requests = [
             {"model": self.embedding_model, "content": {"parts": [{"text": t}]}} for t in texts
         ]
-        async with httpx.AsyncClient(timeout=self.timeout_s) as client:
-            response = await client.post(
-                url, params={"key": self.api_key}, json={"requests": requests}
-            )
+        if self._http is None:
+            self._http = httpx.AsyncClient(timeout=self.timeout_s)
+        response = await self._http.post(
+            url, params={"key": self.api_key}, json={"requests": requests}
+        )
         response.raise_for_status()
         payload: dict[str, Any] = response.json()
         return [item["values"] for item in payload["embeddings"]]

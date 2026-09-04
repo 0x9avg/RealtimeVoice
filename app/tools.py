@@ -51,6 +51,13 @@ class ToolRegistry:
     def names(self) -> list[str]:
         return list(self._tools)
 
+    def get(self, name: str) -> Tool | None:
+        """One registered tool, or None if this profile doesn't have it —
+        lets a caller reach a tool's own state (app/session_hub.py asks the
+        G1 visit-intake tool whether an interview is running) without
+        guessing which profile is active."""
+        return self._tools.get(name)
+
     def function_declarations(self) -> list[dict[str, Any]]:
         return [
             {"name": tool.name, "description": tool.description, "parameters": tool.parameters}

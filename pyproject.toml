@@ -36,6 +36,14 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
 ]
+# Only for scripts/build_wall_agent_windows.bat, run on a Windows BUILD
+# machine to produce the standalone wall-agent.exe (see that script and
+# README.md's "Видеостена" — "Установка на Windows-ПК стены"). Not needed
+# on the robot or in normal dev — a separate group so `uv sync` there never
+# pulls in PyInstaller by default.
+build-windows = [
+    "pyinstaller>=6.10",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

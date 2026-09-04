@@ -90,6 +90,14 @@ class Settings(BaseModel):
     wall_agent_token: str = os.environ.get("WALL_AGENT_TOKEN", "")
     wall_agent_timeout_s: float = 5.0
 
+    # Hard cap on ONE tool call (app/session_hub.py's _run_tool). The model
+    # holds its turn until the tool answers, so this is dead air the visitor
+    # actually stands through — past this point it's better to tell the
+    # model the tool failed (it can say so) than to keep waiting out a
+    # network timeout. Sits below the tools' own timeouts on purpose
+    # (wall agent 5s, embeddings 20s), so it is the one that bites first.
+    tool_timeout_s: float = float(os.environ.get("TOOL_TIMEOUT_S", "8"))
+
     # Robot mic/speaker (app/robot_main.py — the on-robot runner, no browser).
     # Defaults match this R1's /etc/humanoid-robot/voice-live.yaml exactly:
     # head-mic multicast group/port and the DDS control interface/IP.
@@ -109,8 +117,20 @@ class Settings(BaseModel):
     robot_speaker_volume_pct: int = int(os.environ.get("ROBOT_SPEAKER_VOLUME", "100"))
     # No AEC on this hardware: mic frames are dropped while the robot speaks,
     # plus this long after it stops, or it reliably hears (and reacts to)
-    # its own voice. Matches humanoid-robot's voice_live/runner.py.
-    robot_post_speech_guard_ms: int = int(os.environ.get("ROBOT_POST_SPEECH_GUARD_MS", "750"))
+    # its own voice.
+    #
+    # This is dead time on EVERY turn — the visitor typically starts
+    # answering the moment the robot stops, and whatever they say inside
+    # this window is thrown away, which both loses words and pushes back
+    # the model's end-of-speech detection. It was 750ms (inherited from
+    # humanoid-robot's voice_live/runner.py) back when the gate re-opened
+    # on TurnComplete — i.e. while the tail of the utterance could still be
+    # playing, so the margin was covering for that. app/session_hub.py now
+    # re-opens it only once playback has actually finished
+    # (_drain_speaker's _END_OF_TURN), so the margin only needs to cover
+    # the speaker's own decay. Raise it again if the robot starts
+    # interrupting itself; lower it further to shave the turn.
+    robot_post_speech_guard_ms: int = int(os.environ.get("ROBOT_POST_SPEECH_GUARD_MS", "300"))
 
     # Presence detection (app/presence.py, app/robot_camera.py) — greets a
     # visitor once they appear, per R1 ТЗ §4.1 / G1 ТЗ §3.1. Camera access
@@ -156,6 +176,16 @@ class Settings(BaseModel):
     # becomes irrelevant in this mode. Set both AUDIO_INPUT and AUDIO_OUTPUT
     # to "robot" for the full on-robot experience with browser-side status.
     audio_input: str = os.environ.get("AUDIO_INPUT", "browser")
+
+    # Optional THIRD mic choice, independent of audio_input above: an
+    # external USB microphone (e.g. a USB conference speakerphone) plugged
+    # into the robot's own onboard computer, captured via ALSA/`arecord`
+    # rather than the vendor SDK (see app/robot_audio.py's UsbMic). Name the
+    # ALSA card by its ID from `arecord -l`/`/proc/asound/cards` (e.g.
+    # "hw:MS,0"), not its numeric index, which can shift when other USB
+    # audio devices are plugged in. Empty (default) means this choice isn't
+    # offered at all — most deployments don't have one.
+    usb_mic_alsa_device: str = os.environ.get("USB_MIC_ALSA_DEVICE", "")
 
     # RAG over app/../knowledge/ (see app/knowledge.py) — drop .txt/.md files
     # in there and control_video_wall's neighbour tool, search_knowledge,

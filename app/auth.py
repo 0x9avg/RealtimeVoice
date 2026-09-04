@@ -33,17 +33,32 @@ from fastapi import Header, HTTPException, Query
 from app.config import settings
 
 
+def token_matches(supplied: str, expected: str) -> bool:
+    """Constant-time token comparison, safe for arbitrary caller input.
+
+    hmac.compare_digest, not ==: a plain string comparison short-circuits on
+    the first mismatched character, so how long a wrong guess survives leaks
+    how many leading characters it got right — a timing side channel an
+    attacker can use to brute-force the token one character at a time.
+
+    The .encode() is equally load-bearing: compare_digest REFUSES str
+    arguments containing non-ASCII (raises TypeError), and both the
+    `?token=` query param and the Authorization header carry whatever bytes
+    the caller sends. Comparing the str forms directly turned any request
+    with a non-ASCII token into an unhandled 500 (and, on /ws/session, a
+    crashed handler) instead of a plain 401.
+    """
+    return hmac.compare_digest(
+        supplied.encode("utf-8", "surrogatepass"),
+        expected.encode("utf-8", "surrogatepass"),
+    )
+
+
 def require_token(authorization: str = Header(default=""), token: str = Query(default="")) -> None:
     if not settings.access_token:
         return
-    # hmac.compare_digest, not ==: a plain string comparison short-circuits
-    # on the first mismatched character, so how long a wrong guess survives
-    # leaks how many leading characters it got right — a timing side
-    # channel an attacker can use to brute-force the token one character at
-    # a time. compare_digest always takes the same time regardless of where
-    # (or whether) the strings differ.
-    if hmac.compare_digest(
-        authorization, f"Bearer {settings.access_token}"
-    ) or hmac.compare_digest(token, settings.access_token):
+    if token_matches(authorization, f"Bearer {settings.access_token}") or token_matches(
+        token, settings.access_token
+    ):
         return
     raise HTTPException(status_code=401, detail="unauthorized")

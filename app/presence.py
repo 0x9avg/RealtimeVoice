@@ -22,6 +22,7 @@ model. `PresenceRunner` (runner.py) keeps the same quiet/present hysteresis
 
 from __future__ import annotations
 
+import asyncio
 import io
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -102,7 +103,11 @@ class PresenceRunner:
 
     async def step(self, frame: bytes) -> None:
         """One score+transition cycle (extracted for tests)."""
-        score = self._detector.score(frame)
+        # Off-loop: score() decodes a 1280x720 JPEG and diffs it with numpy
+        # — tens of milliseconds of pure CPU on the robot, every frame. Run
+        # inline it stalls the event loop, and the loop is what paces the
+        # robot's own speech out in 50ms slots, so the stutter is audible.
+        score = await asyncio.to_thread(self._detector.score, frame)
         if score >= self._threshold:
             self._active_streak += 1
             self._quiet_streak = 0
