@@ -24,6 +24,14 @@ dependencies = [
     # 3.13+. The robot runs 3.12; this shim only matters for dev machines on
     # newer Python (this one is 3.14).
     "audioop-lts>=0.2; python_version >= '3.13'",
+    # app/wake_word.py — local wake-word gate for the hardware mic (item 5,
+    # 2026-09-04 fixes list; switched from openWakeWord to faster-whisper
+    # the same day so the wake phrase can be Russian — see that module's
+    # docstring). Prebuilt wheels (ctranslate2 included) for both x86_64
+    # and aarch64/cp312 — no manual/vendor install dance needed, plain
+    # `uv sync` covers it. Only actually imported (and its model loaded) if
+    # a hardware mic is configured — see WakeWordDetector._ensure_model.
+    "faster-whisper>=1.0",
 ]
 
 # unitree_sdk2py is not on PyPI; it's built on the robot from the vendor's

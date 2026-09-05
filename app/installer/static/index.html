@@ -1,0 +1,813 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Настройка робота — RealtimeVoice</title>
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #f4f6fb;
+    --card: #ffffff;
+    --ink: #1c2430;
+    --ink-dim: #5b6472;
+    --accent: #2f6fed;
+    --accent-ink: #ffffff;
+    --ok: #1c9d5a;
+    --ok-bg: #e7f8ee;
+    --warn: #b3720a;
+    --warn-bg: #fdf3e0;
+    --bad: #c53030;
+    --bad-bg: #fde8e8;
+    --border: #e1e6ef;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    font-size: 16px;
+    line-height: 1.45;
+  }
+  .shell { max-width: 720px; margin: 0 auto; padding: 24px 16px 64px; }
+  header.top {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; margin-bottom: 20px; flex-wrap: wrap;
+  }
+  header.top h1 { font-size: 20px; margin: 0; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 6px 12px; border-radius: 999px; font-size: 14px; font-weight: 600;
+    background: var(--border); color: var(--ink-dim);
+  }
+  .pill.ok { background: var(--ok-bg); color: var(--ok); }
+  .pill.bad { background: var(--bad-bg); color: var(--bad); }
+  .pill.warn { background: var(--warn-bg); color: var(--warn); }
+
+  .steps {
+    display: flex; gap: 6px; margin-bottom: 20px; flex-wrap: wrap;
+  }
+  .step-dot {
+    flex: 1; min-width: 40px; text-align: center; padding: 8px 4px;
+    border-radius: 10px; background: var(--card); border: 1px solid var(--border);
+    font-size: 13px; color: var(--ink-dim); cursor: pointer; user-select: none;
+  }
+  .step-dot.active { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  .step-dot.done { color: var(--ok); }
+
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 16px;
+    padding: 24px; margin-bottom: 16px;
+  }
+  .card h2 { margin-top: 0; font-size: 20px; }
+  .card p.hint { color: var(--ink-dim); font-size: 15px; }
+
+  .choice-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 16px 0; }
+  @media (max-width: 480px) { .choice-grid { grid-template-columns: 1fr; } }
+  .choice {
+    border: 2px solid var(--border); border-radius: 14px; padding: 18px 14px;
+    text-align: center; cursor: pointer; background: #fff; transition: border-color .15s;
+  }
+  .choice:hover { border-color: #c7d3ea; }
+  .choice.selected { border-color: var(--accent); background: #eef4ff; }
+  .choice .emoji { font-size: 30px; display: block; margin-bottom: 8px; }
+  .choice .title { font-weight: 700; }
+  .choice .sub { color: var(--ink-dim); font-size: 14px; margin-top: 4px; }
+
+  label.field { display: block; margin: 14px 0; }
+  label.field span.lbl { display: block; font-weight: 600; margin-bottom: 6px; }
+  input[type=text], input[type=password], select {
+    width: 100%; padding: 12px 14px; border-radius: 10px; border: 1px solid var(--border);
+    font-size: 16px; background: #fff; color: var(--ink);
+  }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .row > * { flex: 1; }
+
+  button {
+    font: inherit; border: none; border-radius: 10px; padding: 12px 18px;
+    font-weight: 700; cursor: pointer; font-size: 15px;
+  }
+  button.primary { background: var(--accent); color: var(--accent-ink); }
+  button.primary:disabled { opacity: .5; cursor: not-allowed; }
+  button.ghost { background: #fff; border: 1px solid var(--border); color: var(--ink); }
+  button.danger { background: var(--bad-bg); color: var(--bad); }
+  button.small { padding: 8px 12px; font-size: 14px; }
+
+  .nav-bottom { display: flex; justify-content: space-between; margin-top: 8px; }
+
+  .msg { margin-top: 12px; padding: 12px 14px; border-radius: 10px; font-size: 14px; }
+  .msg.ok { background: var(--ok-bg); color: var(--ok); }
+  .msg.bad { background: var(--bad-bg); color: var(--bad); }
+  .msg.info { background: #eef4ff; color: var(--accent); }
+
+  .checklist { display: flex; flex-direction: column; gap: 8px; margin: 14px 0; }
+  .checklist label {
+    display: flex; align-items: center; gap: 10px; padding: 10px 12px;
+    border: 1px solid var(--border); border-radius: 10px; cursor: pointer;
+  }
+  .checklist input { width: 18px; height: 18px; }
+
+  .log-line { font-family: ui-monospace, monospace; font-size: 12px; color: var(--ink-dim); }
+  .log-entry { margin-bottom: 6px; }
+  .log-entry .friendly { font-family: inherit; font-size: 14px; color: var(--ink); }
+  .spinner { display: inline-block; width: 14px; height: 14px; border-radius: 50%;
+    border: 2px solid #ccc; border-top-color: var(--accent); animation: spin 0.8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .muted { color: var(--ink-dim); font-size: 14px; }
+  a.link { color: var(--accent); font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="shell" id="app">Загрузка…</div>
+
+<script>
+const DEFAULT_WAKE_WORDS = [
+  // Must track app/config.py's WAKE_WORD_PHRASES default — kept as a
+  // suggestion list here only; the source of truth is whatever ends up
+  // saved to .env, not this array.
+  "робот", "ассистент", "помощник", "слушай", "здравствуйте", "привет",
+  "подскажите", "посетитель", "визит", "оформите", "зарегистрируйте",
+];
+
+let state = null;     // last /api/state response
+let view = "loading"; // "wizard" | "dashboard" | "advanced"
+let advancedGroups = null; // populated by openAdvancedSettings() before switching to "advanced"
+let wizardStep = 0;
+let draft = {};        // in-progress edits not yet confirmed by the server
+
+const STEP_TITLES = ["Начало", "Робот", "Ключ Gemini", "Звук", "Пробуждение", "Дополнительно", "Готово"];
+
+async function api(method, path, body) {
+  const res = await fetch(path, {
+    method,
+    headers: body ? { "Content-Type": "application/json" } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  let data = null;
+  try { data = await res.json(); } catch (e) { /* non-JSON (e.g. audio/wav) */ }
+  if (!res.ok) {
+    const detail = (data && data.detail) ? data.detail : res.statusText;
+    throw new Error(detail);
+  }
+  return data;
+}
+
+async function refreshState() {
+  state = await api("GET", "/api/state");
+  if (draft.audio_input === undefined) draft.audio_input = state.audio_input;
+  if (draft.audio_output === undefined) draft.audio_output = state.audio_output;
+  if (draft.usb_mic_alsa_device === undefined) draft.usb_mic_alsa_device = state.usb_mic_alsa_device;
+  if (draft.usb_speaker_alsa_device === undefined) draft.usb_speaker_alsa_device = state.usb_speaker_alsa_device;
+  if (draft.checked_defaults === undefined) {
+    // Split into two fields (which default checkboxes are ticked, and
+    // what custom words were typed) instead of one merged list -- audit
+    // fix, 2026-09-06: a single merged `wake_words` array made the custom-
+    // words textbox a pure ADD-only union (see the old onNext code this
+    // replaced), so a customer removing a word from that textbox to stop
+    // a false-wake nuisance saw it silently reappear on every save.
+    const existing = state.wake_word_phrases
+      ? state.wake_word_phrases.split(",").map(s => s.trim()).filter(Boolean)
+      : DEFAULT_WAKE_WORDS.slice();
+    draft.checked_defaults = DEFAULT_WAKE_WORDS.filter(w => existing.includes(w));
+    draft.custom_words = existing.filter(w => !DEFAULT_WAKE_WORDS.includes(w));
+  }
+  if (draft.presence_enabled === undefined) draft.presence_enabled = state.presence_enabled;
+  if (draft.wall_agent_url === undefined) draft.wall_agent_url = state.wall_agent_url;
+}
+
+function statusPill() {
+  if (!state || !state.service_installed) return `<span class="pill">ещё не запущен</span>`;
+  const active = state.service_status && state.service_status.is_active;
+  return active
+    ? `<span class="pill ok">🟢 работает</span>`
+    : `<span class="pill bad">🔴 остановлен</span>`;
+}
+
+function render() {
+  const root = document.getElementById("app");
+  if (view === "dashboard") { root.innerHTML = renderDashboard(); bindDashboard(); return; }
+  if (view === "advanced") { root.innerHTML = renderAdvancedSettings(); bindAdvancedSettings(); return; }
+  root.innerHTML = renderWizard();
+  bindWizard();
+}
+
+// ---------------------------------------------------------------- wizard --
+
+function renderStepper() {
+  return `<div class="steps">` + STEP_TITLES.map((title, i) => {
+    let cls = "step-dot";
+    if (i === wizardStep) cls += " active";
+    else if (i < wizardStep) cls += " done";
+    return `<div class="${cls}" data-step="${i}">${title}</div>`;
+  }).join("") + `</div>`;
+}
+
+function renderWizard() {
+  const parts = [
+    `<header class="top"><h1>Настройка робота</h1>${statusPill()}</header>`,
+    renderStepper(),
+  ];
+  switch (wizardStep) {
+    case 0: parts.push(stepWelcome()); break;
+    case 1: parts.push(stepProfile()); break;
+    case 2: parts.push(stepApiKey()); break;
+    case 3: parts.push(stepAudio()); break;
+    case 4: parts.push(stepWakeWords()); break;
+    case 5: parts.push(stepExtra()); break;
+    case 6: parts.push(stepFinish()); break;
+  }
+  return parts.join("");
+}
+
+function stepWelcome() {
+  return `
+    <div class="card">
+      <h2>Добро пожаловать 👋</h2>
+      <p class="hint">Этот мастер настроит робота за несколько простых шагов — ключ доступа, звук,
+      слова для пробуждения. Ничего вручную устанавливать не нужно, всё делается на этой странице.</p>
+      <div class="nav-bottom"><span></span><button class="primary" id="btn-next">Начать →</button></div>
+    </div>`;
+}
+
+function stepProfile() {
+  const sel = (p) => (state.profile === p ? "selected" : "");
+  return `
+    <div class="card">
+      <h2>Какой это робот?</h2>
+      <p class="hint">Выберите модель — от этого зависит набор настроек на следующих шагах.</p>
+      <div class="choice-grid">
+        <div class="choice ${sel("r1")}" data-profile="r1">
+          <span class="emoji">🖥️</span><span class="title">R1</span>
+          <span class="sub">Робот-презентатор у видеостены</span>
+        </div>
+        <div class="choice ${sel("g1")}" data-profile="g1">
+          <span class="emoji">🛡️</span><span class="title">G1</span>
+          <span class="sub">Робот поста охраны</span>
+        </div>
+      </div>
+      <div id="profile-msg"></div>
+      <div class="nav-bottom">
+        <button class="ghost" id="btn-back">← Назад</button>
+        <button class="primary" id="btn-next" ${state.profile ? "" : "disabled"}>Далее →</button>
+      </div>
+    </div>`;
+}
+
+function stepApiKey() {
+  return `
+    <div class="card">
+      <h2>Ключ доступа к Gemini</h2>
+      <p class="hint">Это код, который даёт роботу возможность понимать речь и отвечать голосом.
+      Его выдаёт Google AI Studio — обычно его присылает поставщик системы.</p>
+      <label class="field">
+        <span class="lbl">Ключ API</span>
+        <input type="password" id="api-key-input" placeholder="Вставьте ключ сюда"
+          value="${state.api_key_set ? "" : ""}" />
+      </label>
+      <p class="muted">${state.api_key_set ? "Ключ уже сохранён. Оставьте поле пустым, чтобы не менять его." : "Ключ ещё не задан."}</p>
+      <div class="row">
+        <button class="ghost" id="btn-test-key">Проверить ключ</button>
+      </div>
+      <div id="key-msg"></div>
+      <div class="nav-bottom">
+        <button class="ghost" id="btn-back">← Назад</button>
+        <button class="primary" id="btn-next">Далее →</button>
+      </div>
+    </div>`;
+}
+
+function stepAudio() {
+  const mode = draft.audio_input === "usb" || draft.audio_output === "usb" ? "usb"
+    : (draft.audio_input === "robot" ? "robot" : "browser");
+  const opt = (v, emoji, title, sub) => `
+    <div class="choice ${mode === v ? "selected" : ""}" data-audio-mode="${v}">
+      <span class="emoji">${emoji}</span><span class="title">${title}</span><span class="sub">${sub}</span>
+    </div>`;
+  let usbBlock = "";
+  if (mode === "usb") {
+    usbBlock = `
+      <div class="card" style="background:#fafbfd;">
+        <label class="field">
+          <span class="lbl">Микрофон</span>
+          <select id="mic-select"></select>
+        </label>
+        <div class="row">
+          <button class="ghost small" id="btn-test-mic">🎙️ Проверить микрофон (2 сек)</button>
+          <span id="mic-test-status" class="muted"></span>
+        </div>
+        <div id="mic-audio-holder"></div>
+        <label class="field">
+          <span class="lbl">Динамик</span>
+          <select id="speaker-select"></select>
+        </label>
+        <div class="row">
+          <button class="ghost small" id="btn-test-speaker">🔊 Проверить динамик</button>
+          <span id="speaker-test-status" class="muted"></span>
+        </div>
+      </div>`;
+  }
+  return `
+    <div class="card">
+      <h2>Как робот будет слышать и говорить?</h2>
+      <p class="hint">Выберите, откуда идёт звук. Если не уверены — оставьте «Через браузер»,
+      это подходит для проверки с компьютера или телефона.</p>
+      <div class="choice-grid">
+        ${opt("browser", "💻", "Через браузер", "Звук идёт через открытую страницу")}
+        ${opt("robot", "🤖", "Через самого робота", "Встроенный микрофон и динамик")}
+        ${opt("usb", "🎧", "Через USB-гарнитуру", "Внешний микрофон/колонка, например Jabra")}
+      </div>
+      ${usbBlock}
+      <div id="audio-msg"></div>
+      <div class="nav-bottom">
+        <button class="ghost" id="btn-back">← Назад</button>
+        <button class="primary" id="btn-next">Далее →</button>
+      </div>
+    </div>`;
+}
+
+function stepWakeWords() {
+  const boxes = DEFAULT_WAKE_WORDS.map(w => `
+    <label><input type="checkbox" data-word="${w}" ${draft.checked_defaults.includes(w) ? "checked" : ""}/> ${w}</label>
+  `).join("");
+  return `
+    <div class="card">
+      <h2>Как разбудить робота?</h2>
+      <p class="hint">Робот всегда локально слушает, не сказал ли кто-то одно из этих слов — ничего не
+      уходит в интернет, пока слово не услышано. Чем больше слов отмечено, тем проще посетителю
+      обратиться к роботу без подсказок, но тем чаще случаются случайные срабатывания от обычных
+      разговоров рядом.</p>
+      <div class="checklist">${boxes}</div>
+      <label class="field">
+        <span class="lbl">Свои слова (через запятую)</span>
+        <input type="text" id="custom-words" value="${escapeHtml(draft.custom_words.join(", "))}" placeholder="например: алло, эй" />
+      </label>
+      <div style="margin-top:8px;">
+        <label><input type="checkbox" id="presence-toggle" ${draft.presence_enabled ? "checked" : ""}/>
+        Робот сам замечает подходящего человека по камере и первым здоровается</label>
+      </div>
+      <div id="wake-msg"></div>
+      <div class="nav-bottom">
+        <button class="ghost" id="btn-back">← Назад</button>
+        <button class="primary" id="btn-next">Далее →</button>
+      </div>
+    </div>`;
+}
+
+function stepExtra() {
+  if (state.profile === "r1") {
+    return `
+      <div class="card">
+        <h2>Видеостена</h2>
+        <p class="hint">Адрес компьютера видеостены, к которому робот будет отправлять команды
+        (переключение разделов презентации). Уточните у того, кто настраивал видеостену.</p>
+        <label class="field">
+          <span class="lbl">Адрес</span>
+          <input type="text" id="wall-url" value="${escapeHtml(draft.wall_agent_url || "")}" placeholder="http://192.168.0.10:8093" />
+        </label>
+        <div id="extra-msg"></div>
+        <div class="nav-bottom">
+          <button class="ghost" id="btn-back">← Назад</button>
+          <button class="primary" id="btn-next">Далее →</button>
+        </div>
+      </div>`;
+  }
+  return `
+    <div class="card">
+      <h2>Справочник поста охраны</h2>
+      <p class="hint">Робот отвечает посетителям только тем, что записано в файле
+      <code>config/guard-kb.yaml</code> — список кабинетов и часто задаваемых вопросов. Этот файл
+      редактируется отдельно (текстовым редактором на роботе или с помощью того, кто устанавливал
+      систему) — этот мастер только показывает, загружен ли он.</p>
+      <div id="kb-status" class="msg info">Проверяю…</div>
+      <div class="nav-bottom">
+        <button class="ghost" id="btn-back">← Назад</button>
+        <button class="primary" id="btn-next">Далее →</button>
+      </div>
+    </div>`;
+}
+
+function stepFinish() {
+  return `
+    <div class="card">
+      <h2>Готово к запуску</h2>
+      <p class="hint">Проверьте настройки и нажмите «Запустить робота» — он будет включаться
+      автоматически при каждой перезагрузке.</p>
+      <ul>
+        <li>Робот: <b>${state.profiles[state.profile] || state.profile}</b></li>
+        <li>Ключ Gemini: <b>${state.api_key_set || draft.apiKeyJustSet ? "задан" : "НЕ задан"}</b></li>
+        <li>Звук: <b>${draft.audio_input}</b></li>
+        <li>Слов для пробуждения: <b>${draft.checked_defaults.length + draft.custom_words.length}</b></li>
+      </ul>
+      <div class="row">
+        <button class="ghost" id="btn-back">← Назад</button>
+        <button class="primary" id="btn-run">🚀 Запустить робота</button>
+      </div>
+      <div id="finish-msg"></div>
+    </div>`;
+}
+
+function bindWizard() {
+  const root = document.getElementById("app");
+  // 2026-09-06 audit finding: clicking a step-number dot used to jump
+  // straight there with no save, so edits made on the step being left
+  // (e.g. checking/unchecking wake-word boxes, then clicking "6" instead
+  // of "Далее") were silently lost -- the summary on step 6 read them
+  // from `draft` (still correct in memory) while .env kept whatever was
+  // last actually POSTed, a mismatch between what the customer saw
+  // confirmed and what the robot actually started with. Every way of
+  // leaving a step now goes through the same save-then-navigate path.
+  root.querySelectorAll(".step-dot").forEach(el => el.addEventListener("click", () => {
+    goToStep(parseInt(el.dataset.step, 10));
+  }));
+  const back = root.querySelector("#btn-back");
+  if (back) back.addEventListener("click", () => goToStep(Math.max(0, wizardStep - 1)));
+  const next = root.querySelector("#btn-next");
+  if (next) next.addEventListener("click", onNext);
+
+  if (wizardStep === 1) {
+    root.querySelectorAll(".choice[data-profile]").forEach(el => el.addEventListener("click", async () => {
+      try {
+        await api("POST", "/api/profile", { profile: el.dataset.profile });
+        await refreshState();
+        render();
+      } catch (e) { showMsg("profile-msg", "bad", e.message); }
+    }));
+  }
+
+  if (wizardStep === 2) {
+    root.querySelector("#btn-test-key").addEventListener("click", async () => {
+      const val = document.getElementById("api-key-input").value;
+      if (!val.trim()) { showMsg("key-msg", "bad", "Введите ключ."); return; }
+      showMsg("key-msg", "info", `<span class="spinner"></span> Проверяю…`);
+      try {
+        const res = await api("POST", "/api/api-key", { api_key: val });
+        draft.apiKeyJustSet = res.ok;
+        showMsg("key-msg", res.ok ? "ok" : "bad", res.message);
+        await refreshState();
+      } catch (e) { showMsg("key-msg", "bad", e.message); }
+    });
+  }
+
+  if (wizardStep === 3) {
+    root.querySelectorAll(".choice[data-audio-mode]").forEach(el => el.addEventListener("click", () => {
+      const mode = el.dataset.audioMode;
+      draft.audio_input = mode; draft.audio_output = mode;
+      render();
+    }));
+    if (document.getElementById("mic-select")) loadAudioDevices();
+    const testMic = root.querySelector("#btn-test-mic");
+    if (testMic) testMic.addEventListener("click", async () => {
+      const dev = document.getElementById("mic-select").value;
+      if (!dev) return;
+      document.getElementById("mic-test-status").innerHTML = `<span class="spinner"></span> Говорите…`;
+      try {
+        const res = await fetch("/api/audio/test-mic", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ alsa_device: dev }),
+        });
+        if (!res.ok) throw new Error((await res.json()).detail || "ошибка записи");
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        document.getElementById("mic-test-status").textContent = "Готово — прослушайте запись:";
+        document.getElementById("mic-audio-holder").innerHTML = `<audio controls src="${url}"></audio>`;
+      } catch (e) {
+        document.getElementById("mic-test-status").textContent = "❌ " + e.message;
+      }
+    });
+    const testSpeaker = root.querySelector("#btn-test-speaker");
+    if (testSpeaker) testSpeaker.addEventListener("click", async () => {
+      const dev = document.getElementById("speaker-select").value;
+      if (!dev) return;
+      document.getElementById("speaker-test-status").innerHTML = `<span class="spinner"></span> Воспроизвожу…`;
+      try {
+        await api("POST", "/api/audio/test-speaker", { alsa_device: dev });
+        document.getElementById("speaker-test-status").textContent = "Вы услышали короткий сигнал?";
+      } catch (e) {
+        document.getElementById("speaker-test-status").textContent = "❌ " + e.message;
+      }
+    });
+  }
+
+  if (wizardStep === 4) {
+    root.querySelectorAll("input[data-word]").forEach(cb => cb.addEventListener("change", () => {
+      const w = cb.dataset.word;
+      draft.checked_defaults = draft.checked_defaults.filter(x => x !== w);
+      if (cb.checked) draft.checked_defaults.push(w);
+    }));
+    root.querySelector("#presence-toggle").addEventListener("change", (e) => {
+      draft.presence_enabled = e.target.checked;
+    });
+  }
+
+  if (wizardStep === 5 && state.profile === "g1") loadGuardKbStatus();
+
+  if (wizardStep === 6) {
+    root.querySelector("#btn-run").addEventListener("click", onFinish);
+  }
+}
+
+async function loadAudioDevices() {
+  const { capture, playback } = await api("GET", "/api/audio/devices");
+  const micSel = document.getElementById("mic-select");
+  const spkSel = document.getElementById("speaker-select");
+  const fill = (sel, items, current) => {
+    if (!items.length) {
+      sel.innerHTML = `<option value="">Устройства не найдены</option>`;
+      return;
+    }
+    sel.innerHTML = items.map(d => `<option value="${escapeHtml(d.id)}" ${d.id === current ? "selected" : ""}>${escapeHtml(d.label)}</option>`).join("");
+  };
+  fill(micSel, capture, draft.usb_mic_alsa_device);
+  fill(spkSel, playback, draft.usb_speaker_alsa_device);
+  micSel.addEventListener("change", () => draft.usb_mic_alsa_device = micSel.value);
+  spkSel.addEventListener("change", () => draft.usb_speaker_alsa_device = spkSel.value);
+}
+
+async function loadGuardKbStatus() {
+  try {
+    const res = await api("GET", "/api/guard-kb/status");
+    const el = document.getElementById("kb-status");
+    if (!res.exists) {
+      el.className = "msg bad";
+      el.textContent = `Файл не найден: ${res.path}`;
+    } else if (res.rooms === 0 && res.faq === 0) {
+      el.className = "msg warn";
+      el.textContent = `Файл найден, но пуст (${res.path}) — заполните его реальными данными перед вводом в эксплуатацию.`;
+    } else {
+      el.className = "msg ok";
+      el.textContent = `Загружен: ${res.rooms} кабинетов, ${res.faq} вопросов (${res.path}).`;
+    }
+  } catch (e) {
+    document.getElementById("kb-status").textContent = "Не удалось проверить: " + e.message;
+  }
+}
+
+function showMsg(id, kind, html) {
+  const el = document.getElementById(id);
+  if (el) { el.className = "msg " + kind; el.innerHTML = html; }
+}
+
+// Persists whatever the CURRENT step's inputs hold, regardless of how the
+// customer is about to leave that step (Далее, Назад, or a stepper dot) --
+// see bindWizard's comment for why every navigation path must go through
+// this instead of only the "Далее" button.
+async function saveCurrentStep() {
+  if (wizardStep === 2) {
+    const keyInput = document.getElementById("api-key-input");
+    if (keyInput && keyInput.value.trim()) {
+      await api("POST", "/api/api-key", { api_key: keyInput.value.trim() });
+    }
+  }
+  if (wizardStep === 3) {
+    await api("POST", "/api/audio", {
+      audio_input: draft.audio_input, audio_output: draft.audio_output,
+      usb_mic_alsa_device: draft.usb_mic_alsa_device || "",
+      usb_speaker_alsa_device: draft.usb_speaker_alsa_device || "",
+    });
+  }
+  if (wizardStep === 4) {
+    const customInput = document.getElementById("custom-words");
+    if (customInput) {
+      draft.custom_words = customInput.value.split(",").map(s => s.trim()).filter(Boolean);
+    }
+    // REPLACE, not union with whatever was saved before -- audit fix,
+    // 2026-09-06: the old code merged custom words into the saved list
+    // with a Set union, so deleting a word from this textbox (e.g. to
+    // stop a false-wake nuisance the wizard itself warns about) never
+    // actually removed it; it just reappeared on the next save.
+    const phrases = [...new Set([...draft.checked_defaults, ...draft.custom_words])];
+    await api("POST", "/api/wake-words", { phrases });
+    await api("POST", "/api/presence", { enabled: draft.presence_enabled });
+  }
+  if (wizardStep === 5 && state.profile === "r1") {
+    const wallInput = document.getElementById("wall-url");
+    if (wallInput) {
+      draft.wall_agent_url = wallInput.value;
+      await api("POST", "/api/wall-agent", { url: draft.wall_agent_url });
+    }
+  }
+  await refreshState();
+}
+
+async function onNext() {
+  try {
+    await saveCurrentStep();
+    wizardStep = Math.min(6, wizardStep + 1);
+    render();
+  } catch (e) {
+    alert("Не удалось сохранить: " + e.message);
+  }
+}
+
+async function goToStep(target) {
+  try {
+    await saveCurrentStep();
+  } catch (e) {
+    alert("Не удалось сохранить: " + e.message);
+    return; // stay put rather than navigating away from an unsaved/broken step
+  }
+  wizardStep = target;
+  render();
+}
+
+async function onFinish() {
+  showMsg("finish-msg", "info", `<span class="spinner"></span> Запускаю службу… при первом запуске это может занять до двух минут.`);
+  try {
+    const res = await api("POST", "/api/finish");
+    showMsg("finish-msg", res.ok ? "ok" : "warn", res.message +
+      (res.ok ? `<br/><a class="link" href="http://${state.lan_ip}:${state.port}" target="_blank">Открыть страницу робота →</a>` : ""));
+    await refreshState();
+    if (res.ok) { view = "dashboard"; render(); }
+  } catch (e) {
+    showMsg("finish-msg", "bad", e.message);
+  }
+}
+
+// ------------------------------------------------------------- dashboard --
+
+function renderDashboard() {
+  return `
+    <header class="top"><h1>${state.profiles[state.profile] || "Робот"}</h1>${statusPill()}</header>
+    <div class="card">
+      <h2>Управление</h2>
+      <div class="row">
+        <button class="primary" id="btn-restart">🔄 Перезапустить</button>
+        <button class="ghost" id="btn-stop">⏹️ Остановить</button>
+        <button class="ghost" id="btn-start">▶️ Запустить</button>
+      </div>
+      <p class="muted">Адрес робота: <a class="link" href="http://${state.lan_ip}:${state.port}" target="_blank">http://${state.lan_ip}:${state.port}</a></p>
+      <div id="dash-msg"></div>
+    </div>
+    <div class="card">
+      <h2>Журнал</h2>
+      <div class="row"><button class="ghost small" id="btn-load-logs">Показать последние записи</button></div>
+      <div id="log-holder" style="margin-top:12px;"></div>
+    </div>
+    <div class="card">
+      <h2>Изменить настройки</h2>
+      <p class="hint">Можно в любой момент вернуться и изменить ключ, звук или слова пробуждения.</p>
+      <div class="row">
+        <button class="ghost" id="btn-edit">⚙️ Открыть мастер настройки</button>
+        <button class="ghost" id="btn-open-advanced">🛠️ Расширенные настройки</button>
+      </div>
+    </div>`;
+}
+
+function bindDashboard() {
+  const root = document.getElementById("app");
+  root.querySelector("#btn-restart").addEventListener("click", () => doServiceAction("restart"));
+  root.querySelector("#btn-stop").addEventListener("click", () => doServiceAction("stop"));
+  root.querySelector("#btn-start").addEventListener("click", () => doServiceAction("start"));
+  root.querySelector("#btn-edit").addEventListener("click", () => { view = "wizard"; wizardStep = 1; render(); });
+  root.querySelector("#btn-open-advanced").addEventListener("click", openAdvancedSettings);
+  root.querySelector("#btn-load-logs").addEventListener("click", loadLogs);
+}
+
+// ------------------------------------------------------------------------
+// Advanced settings -- every remaining .env knob (app/installer/
+// settings_schema.py) that isn't already covered by a friendly wizard
+// step: Gemini model/voice, wake-word tuning, presence tuning, robot/USB
+// hardware audio parameters, knowledge-base/RAG knobs, per-profile paths.
+// 2026-09-06 ask: "добавим ... настройку всех конфигов возможных роботов
+// ... всё, что сейчас нужно менять вручную" -- everything here used to
+// require hand-editing `.env` on the robot over SSH.
+// ------------------------------------------------------------------------
+
+async function openAdvancedSettings() {
+  const root = document.getElementById("app");
+  root.innerHTML = `<div class="card"><span class="spinner"></span> Загружаю настройки…</div>`;
+  try {
+    const res = await api("GET", "/api/advanced-settings");
+    advancedGroups = res.groups;
+    view = "advanced";
+    render();
+  } catch (e) {
+    root.innerHTML = `<div class="card msg bad">Не удалось загрузить настройки: ${e.message}</div>`;
+  }
+}
+
+function renderAdvancedSettings() {
+  const groupsHtml = advancedGroups.map((group, i) => `
+    <div class="card">
+      <details ${i === 0 ? "open" : ""}>
+        <summary style="cursor:pointer; font-weight:700; font-size:17px;">${escapeHtml(group.title)}</summary>
+        ${group.help ? `<p class="hint">${escapeHtml(group.help)}</p>` : ""}
+        <div style="margin-top:10px;">
+          ${group.fields.map(renderAdvancedField).join("")}
+        </div>
+      </details>
+    </div>`).join("");
+  return `
+    <header class="top"><h1>Расширенные настройки</h1>${statusPill()}</header>
+    <p class="hint">Здесь собраны все параметры, которые раньше приходилось редактировать вручную в файле
+    <code>.env</code>. Если не уверены, что делает поле — не трогайте его: значение по умолчанию подходит
+    для типовой установки.</p>
+    ${groupsHtml}
+    <div class="card">
+      <div class="row">
+        <button class="ghost" id="btn-adv-back">← Назад к панели</button>
+        <button class="primary" id="btn-adv-save">💾 Сохранить всё</button>
+      </div>
+      <p class="muted">Изменения вступят в силу после перезапуска службы (кнопка «Перезапустить» на панели).</p>
+      <div id="adv-msg"></div>
+    </div>`;
+}
+
+function renderAdvancedField(field) {
+  const id = `adv-${field.key}`;
+  const help = field.help ? `<p class="muted" style="margin:2px 0 10px;">${escapeHtml(field.help)}</p>` : "";
+  if (field.type === "toggle") {
+    return `
+      <div style="margin:14px 0;">
+        <label style="display:flex;align-items:center;gap:8px;">
+          <input type="checkbox" id="${id}" data-key="${field.key}" data-type="toggle" ${field.value === "true" ? "checked" : ""}/>
+          ${escapeHtml(field.label)}
+        </label>
+        ${help}
+      </div>`;
+  }
+  let control;
+  if (field.type === "select") {
+    const opts = (field.options || []).map(o =>
+      `<option value="${escapeHtml(o.value)}" ${o.value === field.value ? "selected" : ""}>${escapeHtml(o.label)}</option>`
+    ).join("");
+    control = `<select id="${id}" data-key="${field.key}" data-type="select">${opts}</select>`;
+  } else {
+    const inputType = field.type === "number" ? "number" : field.type === "password" ? "password" : "text";
+    const stepAttr = field.step ? ` step="${escapeHtml(field.step)}"` : "";
+    control = `<input type="${inputType}" id="${id}" data-key="${field.key}" data-type="${field.type}"${stepAttr} value="${escapeHtml(field.value)}" />`;
+  }
+  return `
+    <label class="field">
+      <span class="lbl">${escapeHtml(field.label)}</span>
+      ${control}
+    </label>
+    ${help}`;
+}
+
+function bindAdvancedSettings() {
+  const root = document.getElementById("app");
+  root.querySelector("#btn-adv-back").addEventListener("click", () => { view = "dashboard"; render(); });
+  root.querySelector("#btn-adv-save").addEventListener("click", saveAdvancedSettings);
+}
+
+async function saveAdvancedSettings() {
+  const root = document.getElementById("app");
+  const values = {};
+  root.querySelectorAll("[data-key]").forEach(el => {
+    values[el.dataset.key] = el.dataset.type === "toggle" ? (el.checked ? "true" : "false") : el.value;
+  });
+  showMsg("adv-msg", "info", `<span class="spinner"></span> Сохраняю…`);
+  try {
+    await api("POST", "/api/advanced-settings", { values });
+    showMsg("adv-msg", "ok", "Сохранено.");
+  } catch (e) {
+    showMsg("adv-msg", "bad", e.message);
+  }
+}
+
+async function doServiceAction(verb) {
+  showMsg("dash-msg", "info", `<span class="spinner"></span> Выполняю…`);
+  try {
+    await api("POST", `/api/service/${verb}`);
+    await new Promise(r => setTimeout(r, 1000));
+    await refreshState();
+    showMsg("dash-msg", "ok", "Готово.");
+    render();
+  } catch (e) {
+    showMsg("dash-msg", "bad", e.message);
+  }
+}
+
+async function loadLogs() {
+  const holder = document.getElementById("log-holder");
+  holder.innerHTML = `<span class="spinner"></span> Загружаю…`;
+  try {
+    const res = await api("GET", "/api/service/logs?lines=80");
+    holder.innerHTML = res.entries.map(e => `
+      <div class="log-entry">
+        ${e.friendly ? `<div class="friendly">${e.friendly}</div>` : ""}
+        <div class="log-line">${escapeHtml(e.raw)}</div>
+      </div>`).join("") || `<span class="muted">Пусто.</span>`;
+  } catch (e) {
+    holder.innerHTML = `<span class="muted">Не удалось загрузить: ${e.message}</span>`;
+  }
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+// ------------------------------------------------------------------ init --
+
+(async function init() {
+  await refreshState();
+  const active = state.service_installed && state.service_status && state.service_status.is_active;
+  view = active ? "dashboard" : "wizard";
+  wizardStep = 0;
+  render();
+})();
+</script>
+</body>
+</html>

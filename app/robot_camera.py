@@ -51,6 +51,7 @@ class RobotCamera:
 
     network_interface: str
     _client: Any = field(default=None, init=False, repr=False)
+    _consecutive_failures: int = field(default=0, init=False, repr=False)
 
     def _ensure_client(self) -> Any:
         if self._client is not None:
@@ -68,8 +69,28 @@ class RobotCamera:
         client = self._ensure_client()
         code, data = client.GetImageSample()
         if code != 0 or not data:
-            _LOG.warning("GetImageSample returned code=%s", code)
+            self._consecutive_failures += 1
+            # 2026-09-06 audit finding: this used to WARNING-log on EVERY
+            # failed poll -- at presence_camera_fps (default 8/s) that's
+            # up to 8 log lines a second, forever, if the camera is simply
+            # misconfigured (wrong PRESENCE_CAMERA_IFACE, or hardware
+            # genuinely wired to a different onboard computer than
+            # expected — a real possibility per this module's own
+            # docstring), with no single clear "this isn't working"
+            # diagnosis to act on, just an endless trickle. Log the first
+            # failure immediately, then only occasionally after that.
+            if self._consecutive_failures == 1 or self._consecutive_failures % 500 == 0:
+                _LOG.warning(
+                    "camera.grab_failed code=%s consecutive_failures=%d "
+                    "(check PRESENCE_CAMERA_IFACE, and that this robot's "
+                    "camera is actually reachable on that network interface)",
+                    code,
+                    self._consecutive_failures,
+                )
             return None
+        if self._consecutive_failures:
+            _LOG.info("camera.recovered after_failures=%d", self._consecutive_failures)
+        self._consecutive_failures = 0
         return bytes(data)
 
     async def frames(self, *, fps: float) -> AsyncIterator[bytes]:

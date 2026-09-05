@@ -26,7 +26,14 @@ _DEFAULT_WS_HOST = "generativelanguage.googleapis.com"
 # was NOT reachable with that key. Model availability is tied to the
 # account/key, so override via GEMINI_LIVE_MODEL if this one 404s for you.
 _DEFAULT_MODEL = "models/gemini-3.1-flash-live-preview"
-_DEFAULT_VOICE = "Fenrir"
+# Item 10 of the 2026-09-04 fixes list: both profiles shared one voice
+# (Fenrir) — picked per-role instead: Puck (upbeat, per Google's own voice
+# descriptions) for R1's presenter role, Charon (informative/measured) for
+# G1's security-desk role. Neither has been vetted by ear against this
+# account's actual audio output — override with GEMINI_LIVE_VOICE if either
+# reads wrong in practice; see https://ai.google.dev/gemini-api/docs/live
+# for the full prebuilt voice list.
+_DEFAULT_VOICE_BY_PROFILE = {"r1": "Puck", "g1": "Charon"}
 _DEFAULT_TIMEZONE = "Asia/Almaty"
 # Not live-verified against this account the way the Live model above was —
 # same caveat applies: override via GEMINI_EMBEDDING_MODEL if this 404s.
@@ -51,7 +58,10 @@ class Settings(BaseModel):
     ws_host: str = _DEFAULT_WS_HOST
     api_key_env: str = "GEMINI_API_KEY"
     model: str = os.environ.get("GEMINI_LIVE_MODEL", _DEFAULT_MODEL)
-    voice_name: str = os.environ.get("GEMINI_LIVE_VOICE", _DEFAULT_VOICE)
+    voice_name: str = os.environ.get(
+        "GEMINI_LIVE_VOICE",
+        _DEFAULT_VOICE_BY_PROFILE.get(os.environ.get("ROBOT_PROFILE", "r1"), "Puck"),
+    )
     # BCP-47 code that PINS the spoken language. Empty (default) lets the
     # model answer in whatever language it was addressed in. Left empty on
     # purpose even though we restrict languages — speechConfig.languageCode
@@ -69,18 +79,69 @@ class Settings(BaseModel):
     reconnect_backoff_max_s: float = 30.0
     # Gemini Live itself closes a long-lived BidiGenerateContent session with
     # a 1008 "policy violation" once it's been open too long / accumulated
-    # too much context — observed live on this project at ~9m22s into one
-    # continuous session with several tool calls. Two costs of hitting that
-    # instead of refreshing first: (1) the hard cutoff itself loses the
-    # in-flight turn, and (2) per-turn latency creeps up as the same
-    # session's context keeps growing right up until then. Proactively
-    # reconnecting BETWEEN turns before that point (see
-    # GeminiLiveAdapter.events()) avoids both — conversational memory is
-    # already not preserved across a reconnect either way (no session-
-    # resumption token is used), so a clean scheduled swap costs nothing
-    # extra. Conservative default, well under the observed failure point;
-    # tune via env if real-world session lengths say otherwise.
-    max_session_duration_s: float = float(os.environ.get("MAX_SESSION_DURATION_S", "360"))
+    # too much context. Two costs of hitting that instead of refreshing
+    # first: (1) the hard cutoff itself loses the in-flight turn — audible
+    # as the robot stuttering or going silent mid-answer — and (2) per-turn
+    # latency creeps up as the same session's context keeps growing right up
+    # until then, which is exactly the "иногда запинается и очень долго
+    # отвечает" a customer reported 2026-09-06. Proactively reconnecting
+    # BETWEEN turns before that point (see GeminiLiveAdapter.events())
+    # avoids both — conversational memory is already not preserved across a
+    # reconnect either way (no session-resumption token is used), so a
+    # clean scheduled swap costs nothing extra (measured live: ~150-300ms
+    # connecting -> connected, imperceptible between two turns).
+    #
+    # 360s was the original default (observed failure point on this project
+    # was ~9m22s at the time). Tightened hard to 90s after live evidence,
+    # same day, that it was nowhere near conservative enough for G1's real
+    # usage: G1's logs showed Gemini forcing 1008 closures roughly every
+    # 150-153s — CONSISTENTLY, three times in a row, never once reaching
+    # the old 360s proactive refresh at all — while R1, in the same window,
+    # hit zero involuntary closures and refreshed cleanly at its own
+    # schedule. The exact reason G1 accumulates whatever Gemini is capping
+    # on faster than R1 is unconfirmed (more/larger tool calls per minute
+    # from search_guard_kb and visit_intake are the leading suspect), but
+    # the mitigation doesn't require knowing why: refresh comfortably
+    # before ANY observed forced closure, on both profiles, rather than
+    # tuning this per-profile with no visibility into the next deployment's
+    # real usage pattern. Tune further via env if a given site's logs still
+    # show 1008s creeping in under 90s.
+    max_session_duration_s: float = float(os.environ.get("MAX_SESSION_DURATION_S", "90"))
+
+    # Gemini Live's OWN native answer to the same problem the setting above
+    # works around from the outside — 2026-09-06, added the same day
+    # MAX_SESSION_DURATION_S was tightened. Once a session's context passes
+    # `context_window_compression_trigger_tokens`, Gemini compresses/
+    # summarizes older turns internally instead of eventually forcing a
+    # hard 1008 close — unlike our own proactive reconnect above, which
+    # deliberately throws away ALL conversational memory every
+    # max_session_duration_s seconds (no session-resumption token is used,
+    # by design, since a clean swap was cheaper to reason about than
+    # resumption), this lets a genuinely long conversation actually keep
+    # its context. The two are complementary, not either/or: keep the
+    # periodic reconnect too, as a safety net for whatever compression
+    # doesn't cover (e.g. non-token limits) — this doesn't replace it, and
+    # turning this on is not a reason to raise max_session_duration_s back
+    # up without new evidence.
+    context_window_compression_enabled: bool = (
+        os.environ.get("CONTEXT_WINDOW_COMPRESSION_ENABLED", "true").lower() == "true"
+    )
+    # Both empty (default) — Google's own SDK examples enable compression
+    # with no explicit values at all and let the platform pick sensible
+    # ones (target defaults to trigger/2 server-side). Only set these if
+    # logs show compression firing too late (context still grows unbounded)
+    # or too often (choppy-feeling summarization) for a real deployment's
+    # actual usage pattern.
+    context_window_compression_trigger_tokens: int | None = (
+        int(os.environ["CONTEXT_WINDOW_COMPRESSION_TRIGGER_TOKENS"])
+        if os.environ.get("CONTEXT_WINDOW_COMPRESSION_TRIGGER_TOKENS")
+        else None
+    )
+    context_window_compression_target_tokens: int | None = (
+        int(os.environ["CONTEXT_WINDOW_COMPRESSION_TARGET_TOKENS"])
+        if os.environ.get("CONTEXT_WINDOW_COMPRESSION_TARGET_TOKENS")
+        else None
+    )
 
     # Video-wall control agent (see app/wall/ — a local, Linux-runnable port
     # of ../../humanoid-robot/apps/wall-agent's `sim` driver). Point this at
@@ -98,7 +159,7 @@ class Settings(BaseModel):
     # (wall agent 5s, embeddings 20s), so it is the one that bites first.
     tool_timeout_s: float = float(os.environ.get("TOOL_TIMEOUT_S", "8"))
 
-    # Robot mic/speaker (app/robot_main.py — the on-robot runner, no browser).
+    # Robot mic/speaker (app/robot_audio.py, driven by app/main.py's SessionHub).
     # Defaults match this R1's /etc/humanoid-robot/voice-live.yaml exactly:
     # head-mic multicast group/port and the DDS control interface/IP.
     robot_mic_multicast_group: str = os.environ.get("ROBOT_MIC_GROUP", "239.168.123.161")
@@ -161,31 +222,172 @@ class Settings(BaseModel):
     # default is 12fps; lower here since we don't know yet how this exact
     # VideoClient/DDS link tolerates sustained polling).
     presence_camera_fps: float = float(os.environ.get("PRESENCE_CAMERA_FPS", "8.0"))
+    # "process" (default) runs the frame-diff scorer in its own OS process
+    # (app/presence_worker.py, spawned by app/presence.py's
+    # SubprocessMotionDetector) instead of a thread in this one — 2026-09-06
+    # UX ask: presence detection must be "отдельный процесс от генерации
+    # речи и слушания", isolated enough that a hiccup there (a slow frame
+    # decode, a crash) can never add latency to or take down the voice
+    # pipeline. "thread" keeps the old asyncio.to_thread-in-process behaviour
+    # (app/presence.py's LocalMotionDetector) — lower overhead, useful for
+    # local dev/tests where spawning a second `python -m` process per test
+    # is unwanted.
+    presence_isolation: str = os.environ.get("PRESENCE_ISOLATION", "process")
 
     # Where app/main.py (the browser text/status UI) plays Gemini's audio
     # back: "browser" streams it to the page over the WS (default — works
     # anywhere); "robot" plays it through the real robot speaker instead
     # (app/robot_audio.py's RobotSpeaker) while text input/status/tool log
-    # stay in the browser. Only meaningful on the robot itself — RobotSpeaker
-    # needs unitree_sdk2py, which isn't installed off-robot.
+    # stay in the browser; "usb" plays it through an external USB speaker
+    # via ALSA (app/robot_audio.py's UsbSpeaker — item 6 of the 2026-09-04
+    # fixes list) — needs usb_speaker_alsa_device set. Only "browser" works
+    # off-robot; "robot" needs unitree_sdk2py, "usb" needs the actual USB
+    # device plugged in.
     audio_output: str = os.environ.get("AUDIO_OUTPUT", "browser")
-    # Symmetric input side: "browser" reads mic audio from the page's WS
-    # binary frames (default); "robot" instead runs a background task
-    # streaming the real head-mic multicast (app/robot_audio.py's RobotMic,
-    # half-duplex-gated) into the session — the browser's own mic button
-    # becomes irrelevant in this mode. Set both AUDIO_INPUT and AUDIO_OUTPUT
-    # to "robot" for the full on-robot experience with browser-side status.
+    # Symmetric input side: "browser" (default) reads mic audio from the
+    # page's WS binary frames — no hardware mic is touched at all in this
+    # mode. "robot" or "usb" turn on hardware-input mode: BOTH the built-in
+    # head-mic (app/robot_audio.py's RobotMic) and, if usb_mic_alsa_device
+    # below is set, an external USB mic (UsbMic) get constructed together
+    # (see app/session_hub.py's __init__ — same pattern AUDIO_OUTPUT already
+    # uses for _speakers), so an operator can switch between them LIVE, from
+    # the website, with no restart and no `.env` edit (2026-09-06 ask,
+    # explicit: "микрофон... выбирается не посредством .env файла, а
+    # напрямую на сайте"). This field only picks the STARTING preference for
+    # a fresh process — see SessionHub.set_preferred_mic_input for the
+    # actual live switch.
+    #
+    # Exactly ONE of the constructed mics is ever allowed to run wake-word
+    # detection at a time — 2026-09-06 ask, explicit: "не должно быть
+    # [разделения и параллельного слушания]. Работает или/или. Оператор сам
+    # выбирает." (this used to NOT be true: both ran their own independent
+    # WakeWordDetector/faster-whisper pass concurrently, racing to "own" the
+    # wake window — wasted CPU and an ambiguous answer to "which mic actually
+    # woke the robot". See app/session_hub.py's `_hw_mic_owns_wake_window`'s
+    # `_preferred_mic_input` gate for the fix.
     audio_input: str = os.environ.get("AUDIO_INPUT", "browser")
 
-    # Optional THIRD mic choice, independent of audio_input above: an
-    # external USB microphone (e.g. a USB conference speakerphone) plugged
-    # into the robot's own onboard computer, captured via ALSA/`arecord`
-    # rather than the vendor SDK (see app/robot_audio.py's UsbMic). Name the
-    # ALSA card by its ID from `arecord -l`/`/proc/asound/cards` (e.g.
-    # "hw:MS,0"), not its numeric index, which can shift when other USB
-    # audio devices are plugged in. Empty (default) means this choice isn't
-    # offered at all — most deployments don't have one.
+    # ALSA device for the USB mic (an external USB microphone, e.g. a USB
+    # conference speakerphone, plugged into the robot's own onboard computer,
+    # captured via ALSA/`arecord` rather than the vendor SDK — see
+    # app/robot_audio.py's UsbMic). Name the ALSA card by its ID from
+    # `arecord -l`/`/proc/asound/cards` (e.g. "hw:MS,0"), not its numeric
+    # index, which can shift when other USB audio devices are plugged in.
+    # Takes effect whenever AUDIO_INPUT is "robot" or "usb" (hardware-input
+    # mode is on at all) — not only when it's specifically "usb", since both
+    # hardware mics are always constructed together (see above); leave empty
+    # to not offer a USB mic at all — most deployments don't have one.
     usb_mic_alsa_device: str = os.environ.get("USB_MIC_ALSA_DEVICE", "")
+
+    # USB speaker for AUDIO_OUTPUT=usb (see above) — defaults to the SAME
+    # device as usb_mic_alsa_device, since the common case (item 6 of the
+    # 2026-09-04 fixes list) is one conference speakerphone (e.g. a Jabra
+    # Speak2) serving as both mic and speaker; override separately only if
+    # they're genuinely different devices.
+    usb_speaker_alsa_device: str = os.environ.get(
+        "USB_SPEAKER_ALSA_DEVICE", os.environ.get("USB_MIC_ALSA_DEVICE", "")
+    )
+    # ALSA mixer target set once at startup (UsbSpeaker.warm_up) — max by
+    # default per that same fixes-list item ("сделаем вывод звука громче,
+    # желательно на максимум").
+    usb_speaker_volume_pct: int = int(os.environ.get("USB_SPEAKER_VOLUME", "100"))
+    # 2026-09-06 audit finding: a real Jabra Speak2 40 MS mis-times playback
+    # declared at Gemini's native 24000 Hz — a precisely-generated 10-second
+    # tone finished in ~7.66s (audibly faster and higher-pitched: "голос
+    # будто слишком быстрый и высокий"), while the SAME test at 32000 Hz
+    # came back accurate to within normal process-start noise. UsbSpeaker
+    # now always resamples to this rate before playing (see its docstring)
+    # instead of trusting a USB device to honor an arbitrary declared rate.
+    # 32000 is empirically verified correct for this exact device, not a
+    # universal constant — override if a different USB speaker needs a
+    # different one (test the same way: time a known-duration tone against
+    # the wall clock at a few candidate rates and pick the one that comes
+    # back accurate).
+    usb_speaker_sample_rate_hz: int = int(os.environ.get("USB_SPEAKER_SAMPLE_RATE", "32000"))
+
+    # Local wake-word gate for the hardware mic (app/wake_word.py, item 5 of
+    # the 2026-09-04 fixes list) — on by default whenever a hardware mic
+    # (robot or usb) is configured; set to false to fall back to the OLD
+    # "manually pick a source" behaviour if it proves unreliable in the
+    # field. Runs a small faster-whisper model on buffered audio windows and
+    # checks the transcript for any of wake_word_phrases — real ASR, not a
+    # trained wake-word classifier, so this works in Russian (or any
+    # language Whisper knows) out of the box, unlike the first
+    # (openWakeWord-based, English-only) attempt at this same feature.
+    # wake_word_window_s is how much audio it buffers before each check —
+    # larger catches longer phrases more reliably but adds latency;
+    # wake_active_window_s (below) is the SEPARATE, much longer post-wake
+    # forwarding duration.
+    wake_word_enabled: bool = os.environ.get("WAKE_WORD_ENABLED", "true").lower() == "true"
+    # Comma-separated — item 2 of the 2026-09-06 UX list: more than one
+    # natural trigger word raises the odds a visitor who never read a sign
+    # near the robot happens to say something that works. Whitespace around
+    # each phrase is trimmed; empty entries are dropped.
+    #
+    # Expanded 2026-09-06 (follow-up: "чтобы человек мог интуитивно без
+    # подсказок его активировать") past the original robot/assistant-style
+    # trigger words to cover what a visitor would plausibly say WITHOUT
+    # ever being told a magic word: an ordinary greeting approaching either
+    # robot ("здравствуйте"/"привет"), a generic request for help
+    # ("подскажите", "помощник"), and — specifically for G1 — the same
+    # words its own system_instruction already recognises as visit-intake
+    # triggers once it's listening (see app/scenarios.py's _G1_TOOL_RULES:
+    # "оформите визит"/"я посетитель"/"зарегистрируйте меня"). Those last
+    # ones matter here for a reason beyond convenience: before this, a
+    # visitor who opened with exactly the phrase the robot is SUPPOSED to
+    # recognise for visit intake ("оформите визит") would get no response
+    # at all, because the hardware mic was never awake to hear it in the
+    # first place — the wake gate ran before the model ever saw the audio.
+    # Harmless to include on the R1 profile too (nobody says "оформите
+    # визит" to a video-wall presenter; it just never fires there).
+    #
+    # Trade-off, worth knowing before tuning this further: broader/more
+    # common words raise recall (robot wakes more reliably on natural
+    # speech) at the cost of more false wakes from ambient conversation
+    # that was never addressed to the robot ("привет"/"здравствуйте" are
+    # the biggest offenders here — busy exhibition-hall chatter will say
+    # these constantly). A false wake costs one wake_active_window_s
+    # (45s default — see that field's own docstring for why it's no longer
+    # 12s) of forwarded audio, not a spoken interruption by
+    # itself — Gemini only actually replies if it decides something in
+    # that window was addressed to it — but it's not free. If false wakes
+    # turn out to be a real nuisance on a given deployment, trim this list
+    # (or drop the two plain greetings) via WAKE_WORD_PHRASES in `.env`
+    # rather than editing code.
+    wake_word_phrases: tuple[str, ...] = tuple(
+        p.strip()
+        for p in os.environ.get(
+            "WAKE_WORD_PHRASES",
+            "робот,ассистент,помощник,слушай,здравствуйте,привет,подскажите,"
+            "посетитель,визит,оформите,зарегистрируйте",
+        ).split(",")
+        if p.strip()
+    )
+    wake_word_language: str = os.environ.get("WAKE_WORD_LANGUAGE", "ru")
+    wake_word_whisper_model: str = os.environ.get("WAKE_WORD_WHISPER_MODEL", "tiny")
+    wake_word_window_s: float = float(os.environ.get("WAKE_WORD_WINDOW_S", "1.5"))
+    # How long the hardware mic keeps forwarding to Gemini after a wake hit
+    # (or the last robot turn, whichever is later — see
+    # app/session_hub.py's TurnComplete handling) before it goes back to
+    # wake-word-only listening.
+    #
+    # Raised from 12.0 to 45.0 on 2026-09-06, by explicit request: "нужно
+    # достаточно большое окно, чтобы люди могли нормально с ним
+    # коммуницировать на презентации". 12s was tuned for quick back-and-
+    # forth, not for a visitor who pauses to read the wall, think about
+    # their next question, or point at something before speaking again —
+    # at 12s that pause alone was enough to put the mic back to sleep,
+    # forcing them to repeat the wake phrase mid-conversation, which reads
+    # as the robot losing interest or malfunctioning, not as a timeout
+    # doing its job. The window still resets on every robot turn, so an
+    # ACTIVE back-and-forth never approaches this ceiling regardless of its
+    # value — this only matters for the length of a single silent pause
+    # within one still-open conversation. Trade-off, same as before: a
+    # longer window means more time a false wake (or a visitor who
+    # wandered off without saying "goodbye") keeps forwarding ambient audio
+    # to Gemini before falling back asleep on its own — 45s is a deliberate
+    # middle ground, not "keep it open indefinitely".
+    wake_active_window_s: float = float(os.environ.get("WAKE_ACTIVE_WINDOW_S", "45.0"))
 
     # RAG over app/../knowledge/ (see app/knowledge.py) — drop .txt/.md files
     # in there and control_video_wall's neighbour tool, search_knowledge,
@@ -205,13 +407,6 @@ class Settings(BaseModel):
     visit_journal_path: str = os.environ.get(
         "VISIT_JOURNAL_PATH", str(_ROOT / "data" / "visits.jsonl")
     )
-
-    # Operator-panel endpoints (app/api_routes.py — visits list/processed,
-    # wall command proxy). Empty (default) disables the check entirely, so
-    # the test bench works with zero setup; set a real value to require
-    # `Authorization: Bearer <token>` (G1 ТЗ §7 — admin functions must be
-    # authorized-only).
-    access_token: str = os.environ.get("ACCESS_TOKEN", "")
 
     @property
     def system_instruction(self) -> str:

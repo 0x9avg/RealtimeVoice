@@ -11,6 +11,8 @@ join/leave/broadcast/history/resilience contract.
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 
 import pytest
 
@@ -51,6 +53,75 @@ def make_hub() -> SessionHub:
     return SessionHub(Settings())
 
 
+# -- AUDIO_INPUT / USB mic: both constructed, ONE preferred at runtime ------
+# 2026-09-06 ask, explicit: "Разделения и параллельного слушания не должно
+# быть. Работает или/или. Оператор сам выбирает" -- AND, in a follow-up,
+# "микрофон... выбирается не посредством .env файла, а напрямую на сайте".
+# So both hardware mics are constructed together whenever AUDIO_INPUT is
+# "robot"/"usb" (mirroring _speakers' pattern, for instant no-restart
+# switching -- see set_preferred_mic_input), but only ONE of them is ever
+# allowed to run wake-word inference (see _hw_mic_owns_wake_window's
+# _preferred_mic_input gate, tested separately below).
+
+
+def test_both_mics_are_constructed_together_when_audio_input_is_robot_or_usb() -> None:
+    hub = SessionHub(Settings(audio_input="robot", usb_mic_alsa_device="hw:MS,0"))
+    assert hub.mic is not None
+    assert hub.usb_mic is not None
+
+    hub2 = SessionHub(Settings(audio_input="usb", usb_mic_alsa_device="hw:MS,0"))
+    assert hub2.mic is not None
+    assert hub2.usb_mic is not None
+
+
+def test_usb_mic_is_not_constructed_without_a_configured_alsa_device() -> None:
+    hub = SessionHub(Settings(audio_input="robot", usb_mic_alsa_device=""))
+    assert hub.mic is not None
+    assert hub.usb_mic is None
+
+
+def test_neither_mic_is_constructed_for_browser_input_even_with_a_usb_device_set() -> None:
+    """browser input means no hardware-input mode at all -- same convention
+    _speakers already uses for AUDIO_OUTPUT=browser."""
+    hub = SessionHub(Settings(audio_input="browser", usb_mic_alsa_device="hw:MS,0"))
+    assert hub.mic is None
+    assert hub.usb_mic is None
+
+
+def test_audio_input_only_picks_the_initial_preferred_mic() -> None:
+    """AUDIO_INPUT is just the STARTING preference for a fresh process --
+    the actual choice lives in _preferred_mic_input and is meant to be
+    changed live from the website afterward (set_preferred_mic_input)."""
+    hub = SessionHub(Settings(audio_input="robot", usb_mic_alsa_device="hw:MS,0"))
+    assert hub._preferred_mic_input == "robot"
+
+    hub2 = SessionHub(Settings(audio_input="usb", usb_mic_alsa_device="hw:MS,0"))
+    assert hub2._preferred_mic_input == "usb"
+
+
+async def test_set_preferred_mic_input_switches_live_without_touching_env(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    hub = SessionHub(Settings(audio_input="robot", usb_mic_alsa_device="hw:MS,0"))
+    assert hub._preferred_mic_input == "robot"
+
+    await hub.set_preferred_mic_input("usb")
+
+    assert hub._preferred_mic_input == "usb"
+    # Still both constructed -- switching again must be instant, no re-init.
+    assert hub.mic is not None
+    assert hub.usb_mic is not None
+
+
+async def test_set_preferred_mic_input_ignores_a_source_that_is_not_configured() -> None:
+    hub = SessionHub(Settings(audio_input="robot", usb_mic_alsa_device=""))
+    assert hub._preferred_mic_input == "robot"
+
+    await hub.set_preferred_mic_input("usb")  # not configured -- no-op
+
+    assert hub._preferred_mic_input == "robot"
+
+
 async def test_join_sends_capabilities() -> None:
     hub = make_hub()
     ws = FakeWS()
@@ -64,6 +135,9 @@ async def test_join_sends_capabilities() -> None:
             "robot_mic_active": False,
             "usb_mic": False,
             "usb_mic_active": False,
+            "preferred_mic_input": None,
+            "speaker_targets": [],
+            "active_speaker_target": None,
         },
     )
 
@@ -116,6 +190,9 @@ async def test_mic_source_change_is_broadcast_to_every_open_tab() -> None:
             "robot_mic_active": False,
             "usb_mic": True,
             "usb_mic_active": True,
+            "preferred_mic_input": None,
+            "speaker_targets": [],
+            "active_speaker_target": None,
         },
     )
     assert expected in a.sent, "the tab that made the change must see it confirmed too"
@@ -136,6 +213,70 @@ async def test_mic_source_ignored_when_hardware_not_configured() -> None:
 
     await hub.handle_mic_source("usb")
     assert robot_mic_state.active_source == "browser"
+
+
+class FakeOutputSpeaker:
+    def __init__(self) -> None:
+        self.stopped = False
+
+    async def stop(self) -> None:
+        self.stopped = True
+
+    async def warm_up(self) -> None:
+        return None
+
+
+async def test_handle_audio_output_switches_target_and_stops_the_old_one() -> None:
+    """Item 2 of the 2026-09-05 fixes list: runtime toggle between hardware
+    speaker targets. Switching must stop whatever the PREVIOUSLY active
+    speaker still had in flight -- not the newly selected one (see
+    handle_audio_output's docstring for why ordering matters here)."""
+    hub = make_hub()
+    robot_speaker = FakeOutputSpeaker()
+    usb_speaker = FakeOutputSpeaker()
+    hub._speakers = {"robot": robot_speaker, "usb": usb_speaker}
+    hub._active_speaker_target = "robot"
+
+    await hub.handle_audio_output("usb")
+
+    assert hub._active_speaker_target == "usb"
+    assert hub.speaker is usb_speaker
+    assert robot_speaker.stopped is True, "the OLD (robot) speaker must be stopped, not the new one"
+    assert usb_speaker.stopped is False
+
+
+async def test_handle_audio_output_ignores_unconfigured_or_already_active_target() -> None:
+    hub = make_hub()
+    robot_speaker = FakeOutputSpeaker()
+    hub._speakers = {"robot": robot_speaker}
+    hub._active_speaker_target = "robot"
+
+    await hub.handle_audio_output("usb")  # not configured -- no-op
+    assert hub._active_speaker_target == "robot"
+    assert robot_speaker.stopped is False
+
+    await hub.handle_audio_output("robot")  # already active -- no-op
+    assert robot_speaker.stopped is False
+
+
+async def test_audio_output_switch_is_broadcast_to_every_open_tab() -> None:
+    hub = make_hub()
+    hub._speakers = {"robot": FakeOutputSpeaker(), "usb": FakeOutputSpeaker()}
+    hub._active_speaker_target = "robot"
+    a, b = FakeWS(), FakeWS()
+    await hub.join(a)
+    await hub.join(b)
+    a.sent.clear()
+    b.sent.clear()
+
+    await hub.handle_audio_output("usb")
+    await asyncio.sleep(0.05)
+
+    for ws in (a, b):
+        types_and_targets = [
+            msg.get("active_speaker_target") for _, msg in ws.sent if msg.get("type") == "capabilities"
+        ]
+        assert "usb" in types_and_targets, "every open tab must learn about the switch live"
 
 
 async def test_late_joiner_replays_history_same_page_as_everyone_else() -> None:
@@ -332,7 +473,11 @@ async def test_barge_in_stops_playback_immediately_not_after_the_utterance() -> 
     Playback now runs on its own task via _drain_speaker."""
     hub = make_hub()
     speaker = PacingSpeaker()
-    hub.speaker = speaker
+    # speaker is a read-only property resolving through _speakers/
+    # _active_speaker_target (see SessionHub.__init__) -- inject the fake
+    # via those instead of the old plain-attribute assignment.
+    hub._speakers = {"robot": speaker}
+    hub._active_speaker_target = "robot"
     hub.gate = None
 
     one_second = b"\x00" * (24_000 * 2)
@@ -376,7 +521,8 @@ async def test_turn_complete_closes_the_stream_after_the_audio_not_before() -> N
     there would cut the last words off and let the robot hear itself."""
     hub = make_hub()
     speaker = PacingSpeaker()
-    hub.speaker = speaker
+    hub._speakers = {"robot": speaker}
+    hub._active_speaker_target = "robot"
     hub.gate = None
 
     half_second = b"\x00" * (24_000 // 2 * 2)
@@ -481,6 +627,153 @@ async def test_robot_mic_task_retries_instead_of_returning_when_stream_ends() ->
         await task
 
 
+class FakeHwMicStream:
+    """Yields a fixed sequence of chunks once, then hangs -- lets a test
+    drive _robot_mic_task deterministically without a real socket/arecord."""
+
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = chunks
+
+    async def stream(self):  # noqa: ANN201 — matches RobotMic/UsbMic's AsyncIterator[bytes]
+        for chunk in self._chunks:
+            yield chunk
+        await asyncio.sleep(1000)
+
+
+class FakeWakeDetector:
+    """feed() returns True on exactly the Nth call (1-indexed) -- lets a
+    test pick precisely which chunk "says" the wake word. Also tracks every
+    chunk fed so far (concatenated) as `recent_audio`, mirroring the real
+    WakeWordDetector's sliding buffer closely enough for tests to verify
+    that the BUFFERED LEAD-UP (not just the single triggering chunk) is
+    what gets forwarded on a wake hit -- see app/wake_word.py's
+    `recent_audio` docstring for why that matters."""
+
+    def __init__(self, trigger_on_call: int) -> None:
+        self.trigger_on_call = trigger_on_call
+        self.calls = 0
+        self.recent_audio = b""
+
+    async def feed(self, pcm: bytes) -> bool:
+        self.calls += 1
+        self.recent_audio += pcm
+        return self.calls == self.trigger_on_call
+
+
+async def test_hw_mic_forwards_only_after_wake_word() -> None:
+    """Regression for item 5 of the 2026-09-04 fixes list: the hardware mic
+    must NOT forward ambient audio to Gemini before the wake word is heard,
+    and MUST start forwarding once it is.
+
+    2026-09-06 audit finding (prompted by a direct question: "won't the
+    robot miss the beginning of the sentence?"): forwarding used to start
+    only from the SINGLE chunk that happened to trigger detection onward --
+    everything the local Whisper check needed to already hear in order to
+    detect the phrase at all (i.e. the wake word itself, spoken during the
+    "before" chunk here) was silently dropped, never reaching Gemini. The
+    detector's buffered lead-up must be replayed as ONE combined chunk on
+    the exact call that triggers, not skipped.
+    """
+    hub = make_hub()
+    hub.mic = FakeHwMicStream([b"before", b"wake", b"after"])
+    hub._wake_detectors = {"robot": FakeWakeDetector(trigger_on_call=2)}  # "wake" chunk triggers
+    hub._preferred_mic_input = "robot"
+
+    sent: list[bytes] = []
+
+    class FakeAdapterForAudio:
+        async def send_audio(self, pcm: bytes) -> None:
+            sent.append(pcm)
+
+    hub.adapter = FakeAdapterForAudio()
+
+    task = asyncio.create_task(hub._robot_mic_task())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert sent == [b"beforewake", b"after"], (
+        "must replay the buffered lead-up (everything the local check heard "
+        "to detect the phrase, not just the single triggering chunk), then "
+        "keep forwarding normally afterward"
+    )
+    assert robot_mic_state.active_source == "robot"
+
+
+async def test_hw_mic_wake_word_ignored_while_robot_is_speaking() -> None:
+    """No AEC on this hardware (see HalfDuplexGate) -- feeding the robot's
+    own voice through the wake-word detector risks a self-triggered wake."""
+    hub = make_hub()
+    hub.mic = FakeHwMicStream([b"chunk1", b"chunk2"])
+    detector = FakeWakeDetector(trigger_on_call=1)
+    hub._wake_detectors = {"robot": detector}
+
+    class AlwaysMutedGate:
+        mic_muted = True
+
+    hub.gate = AlwaysMutedGate()
+
+    sent: list[bytes] = []
+
+    class FakeAdapterForAudio:
+        async def send_audio(self, pcm: bytes) -> None:
+            sent.append(pcm)
+
+    hub.adapter = FakeAdapterForAudio()
+
+    task = asyncio.create_task(hub._robot_mic_task())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert sent == []
+    assert detector.calls == 0, "must not even run wake-word inference while muted"
+
+
+async def test_only_the_preferred_mic_ever_runs_wake_word_detection() -> None:
+    """2026-09-06 ask, explicit: "разделения и параллельного слушания не
+    должно быть... работает или/или". With BOTH a built-in and a USB mic
+    configured, only the PREFERRED one (_preferred_mic_input) may ever run
+    wake-word inference at all -- this is now a deterministic gate, not a
+    race the other source could still "lose" after also paying the cost of
+    a faster-whisper pass (the older, weaker guarantee)."""
+    hub = make_hub()
+    hub.mic = FakeHwMicStream([b"robot1", b"robot2", b"robot3"])
+    hub.usb_mic = FakeHwMicStream([b"usb1", b"usb2", b"usb3"])
+    robot_detector = FakeWakeDetector(trigger_on_call=1)
+    usb_detector = FakeWakeDetector(trigger_on_call=1)
+    hub._wake_detectors = {"robot": robot_detector, "usb": usb_detector}
+    hub._preferred_mic_input = "robot"
+
+    sent_robot: list[bytes] = []
+    sent_usb: list[bytes] = []
+
+    class FakeAdapterForAudio:
+        async def send_audio(self, pcm: bytes) -> None:
+            (sent_robot if pcm.startswith(b"robot") else sent_usb).append(pcm)
+
+    hub.adapter = FakeAdapterForAudio()
+
+    tasks = [
+        asyncio.create_task(hub._robot_mic_task()),
+        asyncio.create_task(hub._usb_mic_task()),
+    ]
+    await asyncio.sleep(0.05)
+    for t in tasks:
+        t.cancel()
+    for t in tasks:
+        with pytest.raises(asyncio.CancelledError):
+            await t
+
+    assert sent_robot and not sent_usb, (
+        f"only the preferred (robot) source should ever forward -- robot={sent_robot} usb={sent_usb}"
+    )
+    assert usb_detector.calls == 0, "the non-preferred mic must never even run wake-word inference"
+    assert robot_mic_state.active_source in ("robot", "usb")
+
+
 class FakeMicThatRaises:
     """A hardware mic whose `stream()` RAISES instead of returning -- e.g.
     UsbMicNotAvailableError when `arecord` itself isn't on PATH (a typo'd
@@ -516,3 +809,41 @@ async def test_usb_mic_task_retries_instead_of_dying_when_stream_raises() -> Non
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+async def test_wake_window_never_expires_during_visit_intake() -> None:
+    """UX audit finding, 2026-09-06: a visitor mid-registration who pauses
+    longer than wake_active_window_s (recalling an ID number, digging for a
+    pass) used to have the hardware mic silently fall back to wake-word-only
+    listening -- their eventual answer was dropped and they had to say the
+    wake phrase again in the middle of a formal interview. While
+    visit_intake is engaged, a source that already owns the window must
+    keep forwarding no matter how long the timer says it's been."""
+    hub = SessionHub(Settings(robot_profile="g1"))
+    hub._wake_detectors = {"robot": FakeWakeDetector(trigger_on_call=1)}
+    robot_mic_state.active_source = "robot"
+    hub._wake_active_until = time.monotonic() - 100.0  # long expired
+
+    intake_tool = hub.tools.get("visit_intake")
+    assert intake_tool is not None
+    intake_tool._intake.start()  # engage the interview directly
+
+    owns = await hub._hw_mic_owns_wake_window("robot", b"pcm")
+    assert owns is True
+    assert robot_mic_state.active_source == "robot", (
+        "must not fall back to browser mid-interview even though the timer expired"
+    )
+
+
+async def test_wake_window_still_expires_normally_outside_visit_intake() -> None:
+    """The intake exception above must not turn into a blanket "never
+    expire" -- ordinary conversation (no interview running) keeps the
+    normal wake_active_window_s timeout."""
+    hub = SessionHub(Settings(robot_profile="g1"))
+    hub._wake_detectors = {"robot": FakeWakeDetector(trigger_on_call=1)}
+    robot_mic_state.active_source = "robot"
+    hub._wake_active_until = time.monotonic() - 100.0  # long expired
+
+    owns = await hub._hw_mic_owns_wake_window("robot", b"pcm")
+    assert owns is False
+    assert robot_mic_state.active_source == "browser", "must go back to sleep as before"

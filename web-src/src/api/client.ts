@@ -1,49 +1,12 @@
 // Small hand-written client — only the 5 endpoints app/api_routes.py
-// actually exposes. Shaped after ../../humanoid-robot/web/dashboard's
-// api/client.ts (getAuthToken/setAuthToken/onUnauthorized + a fetch wrapper
-// that fires onUnauthorized on 401), but that file is 521 lines covering a
-// dozen unrelated subsystems — this is the part worth keeping, rewritten
-// small.
-
-const TOKEN_KEY = "realtimevoice.auth.token";
-
-let cachedToken: string | null = localStorage.getItem(TOKEN_KEY);
-const unauthorizedListeners = new Set<() => void>();
-
-export function getAuthToken(): string | null {
-  return cachedToken;
-}
-
-export function setAuthToken(token: string | null): void {
-  cachedToken = token;
-  if (token) {
-    localStorage.setItem(TOKEN_KEY, token);
-  } else {
-    localStorage.removeItem(TOKEN_KEY);
-  }
-}
-
-export function onUnauthorized(listener: () => void): () => void {
-  unauthorizedListeners.add(listener);
-  return () => unauthorizedListeners.delete(listener);
-}
-
-// Exported so callers OTHER than fetchJson (currently: useVoiceSession.ts,
-// when /ws/session closes with the 4401 "wrong/missing token" code — see
-// app/main.py) can trigger the exact same "show the token prompt" flow as
-// an ordinary REST 401, instead of each surface reinventing its own modal.
-export function notifyUnauthorized(): void {
-  unauthorizedListeners.forEach((listener) => listener());
-}
+// actually exposes. Open API, no auth (item 4 of the 2026-09-04 fixes list
+// removed the whole ACCESS_TOKEN mechanism) — this used to also carry a
+// Bearer token and a 401 -> "show the token prompt" flow, ported from
+// ../../humanoid-robot/web/dashboard's api/client.ts; neither applies here
+// anymore.
 
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
-  const headers = new Headers(init?.headers);
-  if (cachedToken) headers.set("Authorization", `Bearer ${cachedToken}`);
-  const response = await fetch(path, { ...init, headers });
-  if (response.status === 401) {
-    notifyUnauthorized();
-    throw new Error("unauthorized");
-  }
+  const response = await fetch(path, init);
   if (!response.ok) {
     throw new Error(`${init?.method ?? "GET"} ${path} -> HTTP ${response.status}`);
   }

@@ -30,8 +30,14 @@ def main() -> None:
     parser.add_argument(
         "--driver",
         choices=["sim", "pipe"],
-        default="sim",
-        help="sim = in-memory simulator (any OS); pipe = real app via its named pipe (Windows only)",
+        # Default is the REAL driver, not the simulator (item 3 of the
+        # 2026-09-04 fixes list) — the built wall-agent.exe must always
+        # drive the actual Factories.exe unless someone deliberately asks
+        # for the simulator (dev/smoke-test only). Pass --driver sim
+        # explicitly for that — see README.md's "Быстрый запуск для
+        # разработки".
+        default="pipe",
+        help="pipe = real app via its named pipe (Windows only, DEFAULT); sim = in-memory simulator (any OS, dev/test only)",
     )
     parser.add_argument("--host", default="0.0.0.0")  # noqa: S104 — LAN appliance, token-gated
     parser.add_argument("--port", type=int, default=8093)

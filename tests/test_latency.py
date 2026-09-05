@@ -111,7 +111,10 @@ async def test_barge_in_reopens_the_mic_immediately() -> None:
         async def stop(self) -> None:
             return None
 
-    hub.speaker = DummySpeaker()  # type: ignore[assignment]
+    # speaker is a read-only property resolving through _speakers/
+    # _active_speaker_target (see SessionHub.__init__).
+    hub._speakers = {"robot": DummySpeaker()}  # type: ignore[dict-item]
+    hub._active_speaker_target = "robot"
     hub.gate = HalfDuplexGate(guard_s=0.75)
     hub.gate.on_speaking_started()
 

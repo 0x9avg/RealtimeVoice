@@ -60,7 +60,6 @@ async def test_reconnect_puts_the_model_back_on_script() -> None:
     assert intake is not None
 
     intake._intake.start()
-    intake._intake.consume("на русском")
     intake._intake.consume("Иванов Иван Иванович")
     pending = intake.current_question
     assert "организации" in pending, pending
@@ -119,14 +118,11 @@ def test_current_question_tracks_the_interview_position() -> None:
     assert vi.current_question == ""  # idle
 
     vi.start()
-    assert "языке" in vi.current_question  # language choice
-
-    vi.consume("на русском")
-    assert "фамилию" in vi.current_question
+    assert "фамилию" in vi.current_question  # first question now -- no language step
 
     for answer in ("Иванов Иван", "ООО Ромашка", "встреча", "к Петрову", "да", "да"):
         vi.consume(answer)
-    assert "Всё верно" in vi.current_question  # confirmation read-back
+    assert "Верно" in vi.current_question  # confirmation read-back
 
 
 async def test_undeliverable_tool_response_is_logged_not_swallowed(caplog) -> None:

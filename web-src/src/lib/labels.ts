@@ -36,3 +36,21 @@ export function wallOutcomeLabel(outcome: string): string {
       return outcome;
   }
 }
+
+// 2026-09-06 audit finding: HomePage used to render this tab's own
+// WebSocket connection state (useVoiceSession.ts's `wsConnected`) as a bare
+// English word ("connecting"/"open"/"reconnecting") — indistinguishable
+// from the site having frozen when it actually meant "a Wi-Fi blip or a
+// backend restart just happened, retrying automatically".
+export function wsConnectionLabel(state: "connecting" | "open" | "reconnecting"): string {
+  switch (state) {
+    case "connecting":
+      return "Подключение…";
+    case "open":
+      return "";
+    case "reconnecting":
+      return "Нет связи с роботом — переподключаюсь…";
+    default:
+      return state;
+  }
+}

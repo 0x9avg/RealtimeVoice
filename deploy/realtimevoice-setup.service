@@ -1,0 +1,26 @@
+[Unit]
+Description=RealtimeVoice — мастер настройки (веб-интерфейс на порту 8090)
+# Best-effort ordering, same reasoning as realtimevoice-{r1,g1}.service —
+# the wizard itself only needs the network for the Gemini-key check and for
+# being reachable in a browser, both of which tolerate a slow/late network.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Rewritten to the real checkout path by installer/bootstrap.sh at install
+# time (see app/installer/systemd.py's install_unit) — this placeholder
+# only matters if this file is ever copied by hand instead.
+WorkingDirectory=%h/realtimevoice-r1
+Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Deliberately no LD_LIBRARY_PATH/CYCLONEDDS_URI here (unlike the r1/g1
+# units) — the wizard never touches unitree_sdk2py/DDS; audio device
+# testing goes through plain ALSA arecord/aplay subprocesses instead (see
+# app/installer/audio.py).
+ExecStart=%h/.local/bin/uv run uvicorn app.installer.server:app --host 0.0.0.0 --port 8090
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target

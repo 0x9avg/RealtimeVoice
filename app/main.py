@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
@@ -27,39 +26,11 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api_routes import router as api_router
-from app.auth import token_matches
 from app.config import settings
 from app.session_hub import SessionHub
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 _LOG = logging.getLogger("realtimevoice")
-
-_TOKEN_IN_URL_RE = re.compile(r"(token=)[^&\s\"']+")
-
-
-class _RedactTokenFilter(logging.Filter):
-    """Keep ACCESS_TOKEN out of the logs.
-
-    `/ws/session` and `/api/camera/*` take the token as a query parameter
-    (a browser WebSocket/<img> can't send an Authorization header), and
-    uvicorn's access log writes the full request line — so every operator
-    connection was printing a working credential into journald verbatim,
-    where anyone with shell access or a copy of the logs could lift it.
-    """
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        if record.args:
-            record.args = tuple(
-                _TOKEN_IN_URL_RE.sub(r"\1<redacted>", a) if isinstance(a, str) else a
-                for a in (record.args if isinstance(record.args, tuple) else (record.args,))
-            )
-        if isinstance(record.msg, str):
-            record.msg = _TOKEN_IN_URL_RE.sub(r"\1<redacted>", record.msg)
-        return True
-
-
-for _name in ("uvicorn.access", "uvicorn.error", "realtimevoice"):
-    logging.getLogger(_name).addFilter(_RedactTokenFilter())
 
 _WEB_DIR = (Path(__file__).resolve().parent.parent / "web").resolve()
 
@@ -82,24 +53,6 @@ app.include_router(api_router)
 @app.websocket("/ws/session")
 async def session(ws: WebSocket) -> None:
     await ws.accept()
-    # Same secret/rule as app/auth.py's require_token (REST endpoints) —
-    # empty settings.access_token means "no token configured", no-op, same
-    # as everywhere else. A WS handshake can't carry an Authorization
-    # header from browser JS, so this is query-param only (?token=...),
-    # same as the camera <img> stream. This is the ONE actuator surface
-    # that used to have NO auth check at all: anyone on the same network
-    # could open this socket directly (bypassing the page entirely) and
-    # talk to/control the robot — mute it, drive the wall, run visit_intake
-    # — without ever touching the UI. Close with a distinct 4401 code so
-    # the browser side (useVoiceSession.ts) can tell "wrong/missing token"
-    # apart from an ordinary disconnect and prompt for one.
-    # token_matches (app/auth.py), not != — constant-time, and safe against
-    # the non-ASCII input that would otherwise crash this handler.
-    if settings.access_token and not token_matches(
-        ws.query_params.get("token", ""), settings.access_token
-    ):
-        await ws.close(code=4401, reason="unauthorized")
-        return
     await session_hub.join(ws)
     # This one browser tab's own choice of input route — "browser" (its own
     # mic, captured client-side) or not. Per-connection on purpose: unlike
@@ -132,6 +85,17 @@ async def session(ws: WebSocket) -> None:
                 if source in ("browser", "robot", "usb", "none"):
                     mic_source = source
                     await session_hub.handle_mic_source(source)
+            elif payload.get("type") == "audio_output":
+                target = str(payload.get("target", ""))
+                if target in ("robot", "usb"):
+                    await session_hub.handle_audio_output(target)
+            elif payload.get("type") == "mic_input":
+                # 2026-09-06 ask: which hardware mic listens for the wake
+                # word is chosen live from the website, not `.env` — see
+                # SessionHub.set_preferred_mic_input's docstring.
+                preferred = str(payload.get("source", ""))
+                if preferred in ("robot", "usb"):
+                    await session_hub.set_preferred_mic_input(preferred)
             elif payload.get("type") == "mute":
                 await session_hub.handle_mute()
     finally:
@@ -155,7 +119,7 @@ async def spa_fallback(full_path: str) -> FileResponse:
     web/ when the path contains `..` (percent-encoded `..%2f` survives
     routing and lands in `full_path` verbatim), which turned this route
     into an unauthenticated "read any file the process can read" endpoint —
-    `.env` (API key + ACCESS_TOKEN) included. resolve() also collapses
+    `.env` (GEMINI_API_KEY included) among them. resolve() also collapses
     symlinks, so a link inside web/ can't point out either.
     """
     index = _WEB_DIR / "index.html"

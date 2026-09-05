@@ -32,6 +32,7 @@ Two consumption paths, used by app/g1_tools.py's SearchGuardKbTool:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 from dataclasses import dataclass, field
@@ -47,35 +48,82 @@ _WHERE_RE = re.compile(r"\b(где|как\s+пройти|как\s+найти|н�
 
 @dataclass(slots=True)
 class GuardKb:
-    """Parsed customer reference data."""
+    """Parsed customer reference data.
+
+    Live-reloads from disk (`ensure_fresh()`) — UX audit finding,
+    2026-09-06: this used to load ONLY ONCE, at process start (`load()`
+    ran at import time via `_build_default()` below), unlike
+    app/knowledge.py's `KnowledgeBase`, which already re-scans its source
+    files on every tool call. Two "same G1 profile" reference sources with
+    silently different reload behaviour was a real trap: a customer's
+    admin editing `config/guard-kb.yaml` (per the PDF's own instructions)
+    would see no effect at all until someone thought to restart the whole
+    service — indistinguishable, from the outside, from "my edit was
+    wrong". Mirrors `KnowledgeBase.ensure_fresh`'s approach: cheap on the
+    common case (one `stat()` call when the file hasn't changed), a real
+    reparse only when its mtime moves.
+    """
 
     rooms: list[dict[str, str]] = field(default_factory=list)
     faq: list[dict[str, str]] = field(default_factory=list)
     info: str = ""
+    # Set by `load()` — needed so `ensure_fresh()` has something to re-stat.
+    _path: Path | None = field(default=None, init=False, repr=False)
+    _mtime: float = field(default=0.0, init=False, repr=False)
 
     @classmethod
     def load(cls, path: str | Path) -> GuardKb:
+        kb = cls()
+        kb._path = Path(path)
+        kb._reload()
+        return kb
+
+    def ensure_fresh(self) -> None:
+        """Re-read the source YAML if it changed on disk since the last
+        load. Call this before `lookup()`/anywhere `rooms`/`faq`/`info` are
+        read for an actual answer — safe to call on every tool invocation,
+        same convention as `KnowledgeBase.ensure_fresh`.
+        """
+        if self._path is None:
+            return
         try:
-            raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+            mtime = self._path.stat().st_mtime
+        except OSError:
+            return
+        if mtime != self._mtime:
+            _LOG.info("guard_kb.reloading path=%s", self._path)
+            self._reload()
+
+    def _reload(self) -> None:
+        path = self._path
+        assert path is not None  # noqa: S101 — only called via load()/ensure_fresh(), both set it first
+        try:
+            raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         except FileNotFoundError:
             _LOG.info("guard_kb.absent path=%s", path)
-            return cls()
+            return
         except Exception:
             _LOG.exception("guard_kb.unreadable path=%s", path)
-            return cls()
-        rooms = [
+            return
+        self.rooms = [
             {str(k): str(v) for k, v in item.items()}
             for item in raw.get("rooms", [])
             if isinstance(item, dict)
         ]
-        faq = [
+        self.faq = [
             {str(k): str(v) for k, v in item.items()}
             for item in raw.get("faq", [])
             if isinstance(item, dict) and item.get("q") and item.get("a")
         ]
-        info = str(raw.get("info", "") or "")
-        _LOG.info("guard_kb.loaded rooms=%d faq=%d info_chars=%d", len(rooms), len(faq), len(info))
-        return cls(rooms=rooms, faq=faq, info=info)
+        self.info = str(raw.get("info", "") or "")
+        with contextlib.suppress(OSError):
+            self._mtime = path.stat().st_mtime
+        _LOG.info(
+            "guard_kb.loaded rooms=%d faq=%d info_chars=%d",
+            len(self.rooms),
+            len(self.faq),
+            len(self.info),
+        )
 
     @property
     def empty(self) -> bool:

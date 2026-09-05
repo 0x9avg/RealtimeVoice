@@ -235,6 +235,7 @@ class SearchGuardKbTool:
         if not question:
             return ToolResult(ok=False, text="no question was given")
 
+        self.guard_kb.ensure_fresh()
         exact = self.guard_kb.lookup(question)
         if exact is not None:
             return ToolResult(ok=True, text=exact)

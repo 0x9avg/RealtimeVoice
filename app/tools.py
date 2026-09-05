@@ -160,6 +160,14 @@ class ControlVideoWallTool:
     base_url: str
     token: str = ""
     timeout_s: float = 5.0
+    # One HTTP client for the life of the process instead of a fresh one
+    # per command — 2026-09-06 audit finding: every _send() used to open a
+    # brand-new httpx.AsyncClient (a new TCP+TLS-or-plain handshake to the
+    # wall-agent PC) on every single video-wall command, exactly the
+    # anti-pattern app/knowledge.py's KnowledgeBase._http already avoids
+    # for the same reason (avoidable connection-setup latency on a robot
+    # Wi-Fi link, paid while the visitor waits for the wall to switch).
+    _http: httpx.AsyncClient = field(default_factory=httpx.AsyncClient, init=False, repr=False)
     name: str = "control_video_wall"
     description: str = (
         "Control the presentation video wall showing infrastructure projects "
@@ -246,12 +254,12 @@ class ControlVideoWallTool:
     async def _send(self, command: WallCommand) -> ToolResult:
         headers = {"X-Wall-Token": self.token} if self.token else {}
         try:
-            async with httpx.AsyncClient(
-                base_url=self.base_url, timeout=self.timeout_s, headers=headers
-            ) as client:
-                response = await client.post(
-                    "/wall/command", json=command.model_dump(mode="json")
-                )
+            response = await self._http.post(
+                f"{self.base_url}/wall/command",
+                json=command.model_dump(mode="json"),
+                headers=headers,
+                timeout=self.timeout_s,
+            )
         except httpx.HTTPError as exc:
             return ToolResult(ok=False, text=f"the video wall agent is unreachable: {exc}")
 

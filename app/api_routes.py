@@ -1,9 +1,9 @@
 """Operator-panel REST API for the web-src/ (React) frontend.
 
-Kept separate from the WS voice pipeline (app/main.py's /ws/session) on
-purpose: these are the "administrative functions" G1 ТЗ §7 wants gated by
-`require_token` — the voice/visitor interaction itself is not, since a real
-visitor never logs in.
+Kept separate from the WS voice pipeline (app/main.py's /ws/session) — same
+split as before, just no longer auth-gated (item 4 of the 2026-09-04 fixes
+list removed the whole ACCESS_TOKEN mechanism customer-side: this is now an
+intentionally open API, not "gated but the gate is usually left open").
 """
 
 from __future__ import annotations
@@ -12,10 +12,9 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
 
-from app.auth import require_token
 from app.camera_hub import camera_hub
 from app.config import settings
 from app.g1_tools import mark_visit_processed, read_visits
@@ -34,7 +33,7 @@ async def profile() -> dict[str, str]:
     return {"profile": settings.robot_profile}
 
 
-@router.get("/visits", dependencies=[Depends(require_token)])
+@router.get("/visits")
 async def list_visits(
     status: str | None = Query(default=None, pattern="^(new|processed)$"),
     limit: int = Query(default=100, ge=1, le=1000),
@@ -43,7 +42,7 @@ async def list_visits(
     return {"records": records}
 
 
-@router.post("/visits/{visit_id}/processed", dependencies=[Depends(require_token)])
+@router.post("/visits/{visit_id}/processed")
 async def mark_processed(visit_id: str) -> dict[str, Any]:
     ok = mark_visit_processed(Path(settings.visit_journal_path), visit_id)
     if not ok:
@@ -51,7 +50,7 @@ async def mark_processed(visit_id: str) -> dict[str, Any]:
     return {"id": visit_id, "status": "processed"}
 
 
-@router.post("/wall/command", dependencies=[Depends(require_token)])
+@router.post("/wall/command")
 async def wall_command(command: WallCommand) -> dict[str, Any]:
     headers = {"X-Wall-Token": settings.wall_agent_token} if settings.wall_agent_token else {}
     try:
@@ -68,8 +67,7 @@ async def wall_command(command: WallCommand) -> dict[str, Any]:
 
 @router.get("/wall/health")
 async def wall_health() -> dict[str, Any]:
-    """No token — this only reveals connectivity, matching the R1 PDF's
-    "На связи/Нет связи" chip that's visible without logging in."""
+    """Reveals connectivity only, matching the R1 PDF's "На связи/Нет связи" chip."""
     try:
         async with httpx.AsyncClient(
             base_url=settings.wall_agent_url, timeout=settings.wall_agent_timeout_s
@@ -87,7 +85,7 @@ def _mjpeg_part(frame: bytes) -> bytes:
     ).encode() + frame + b"\r\n"
 
 
-@router.get("/camera/snapshot", dependencies=[Depends(require_token)])
+@router.get("/camera/snapshot")
 async def camera_snapshot() -> Response:
     frame = await camera_hub.snapshot()
     if frame is None:
@@ -95,7 +93,7 @@ async def camera_snapshot() -> Response:
     return Response(content=frame, media_type="image/jpeg")
 
 
-@router.get("/camera/stream", dependencies=[Depends(require_token)])
+@router.get("/camera/stream")
 async def camera_stream() -> Response:
     """multipart/x-mixed-replace MJPEG — the browser-native way to show a
     live camera in a plain <img> tag, same as humanoid-robot's camera_mjpeg.py.

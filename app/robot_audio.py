@@ -1,6 +1,7 @@
-r"""R1's real microphone and speaker — used by app/robot_main.py (headless)
-and by app/main.py when AUDIO_INPUT/AUDIO_OUTPUT=robot (browser status UI +
-real hardware audio).
+r"""R1's real microphone and speaker — used by app/main.py when
+AUDIO_INPUT/AUDIO_OUTPUT=robot (browser is the only control surface now —
+item 2 of the 2026-09-04 fixes list removed the separate headless
+app/robot_main.py runner).
 
 Ported from `../../humanoid-robot/packages/humanoid-robot-adapters-unitree-g1/
 src/humanoid_robot/adapters/unitree_g1/{audio_in,audio_out,sdk}.py`, stripped
@@ -31,6 +32,7 @@ import asyncio
 import contextlib
 import importlib
 import logging
+import re
 import socket
 import struct
 import time
@@ -312,6 +314,9 @@ class RobotSpeaker:
     _resample_src_rate: int = field(default=0, init=False)
     # Bumped by stop() to cut an in-flight play() short — see both methods.
     _epoch: int = field(default=0, init=False)
+    # True only until the first play() call of a fresh utterance has primed
+    # the buffer — see play()'s use of this and _LEAD_S's docstring.
+    _is_first_chunk_of_utterance: bool = field(default=True, init=False)
 
     def _ensure_client(self) -> Any:
         if self._client is not None:
@@ -357,8 +362,24 @@ class RobotSpeaker:
             client = await asyncio.to_thread(self._ensure_client)
             epoch = self._epoch
             now = time.monotonic()
-            if self._next_send_monotonic <= now:
+            if self._is_first_chunk_of_utterance:
+                # Prime the vendor buffer ONCE, at the true start of each
+                # utterance (see _LEAD_S's docstring) — not every time this
+                # method happens to be entered. Gemini delivers one
+                # utterance's audio as several AudioChunk events, each
+                # handled by its own play() call (see
+                # session_hub.py's _drain_speaker); between two of THOSE
+                # calls, the schedule normally lands within a few ms of
+                # "now" purely from real-time pacing, which used to satisfy
+                # this same `<= now` check on EVERY call and re-trigger the
+                # ~200ms priming burst mid-sentence — audible as a stutter,
+                # not just a one-time buffer prime.
                 self._next_send_monotonic = now - _LEAD_S
+                self._is_first_chunk_of_utterance = False
+            elif self._next_send_monotonic < now:
+                # Fell behind (processing lag) — resume from now, but don't
+                # re-arm the priming burst for it.
+                self._next_send_monotonic = now
             for offset in range(0, len(converted), _CHUNK_BYTES):
                 # A stop() landed while this call was pacing (barge-in, or
                 # the operator's "Замолчи"). Bail at the chunk boundary
@@ -411,6 +432,7 @@ class RobotSpeaker:
         async with self._lock:
             self._resample_state = None
             self._resample_src_rate = 0
+            self._is_first_chunk_of_utterance = True
             if self._client is None:
                 return
             with contextlib.suppress(Exception):
@@ -433,6 +455,206 @@ class RobotSpeaker:
             if wait > 0:
                 await asyncio.sleep(wait)
         self._next_send_monotonic += _CHUNK_MS / 1000.0
+
+
+# -- usb speaker (external USB speaker/speakerphone, e.g. the same Jabra
+# Speak2 device UsbMic reads from) ------------------------------------------
+
+
+@dataclass(slots=True)
+class UsbSpeaker:
+    """Plays Gemini's audio through a USB speaker via ALSA `aplay`.
+
+    Item 6 of the 2026-09-04 fixes list: route audio output to the same USB
+    device (`alsa_device`, typically identical to `UsbMic.alsa_device` — a
+    conference speakerphone like the Jabra Speak2 is one card with both a
+    capture and a playback substream) instead of the vendor DDS speaker.
+
+    2026-09-06 audit finding: the docstring here used to claim this needs
+    "no resampling ... only sample_rate_hz has to match what aplay was told
+    to expect" — measured FALSE on a real Jabra Speak2 40 MS. Declaring
+    `-r 24000` (Gemini's real output rate) and timing actual playback of a
+    precisely-generated 10-second tone against the wall clock: it finished
+    in ~7.66s, not ~10s — audibly faster and higher-pitched, matching a
+    customer report ("голос будто слишком быстрый и высокий"). Re-running
+    the same measurement at `-r 32000` came back at ~10.15s — accurate to
+    within normal process-start noise. This device's playback engine
+    evidently only clocks certain rates correctly and silently mis-times
+    others instead of rejecting them outright (unlike the channel-count
+    check right below, which at least fails loudly). Rather than trust any
+    particular USB device's rate handling, `play()` now resamples to
+    `target_sample_rate_hz` (`audioop.ratecv`, same mechanism
+    `RobotSpeaker._resample` already uses for its own fixed-rate hardware)
+    before writing — 32000 by default, empirically verified correct for
+    this exact device; override via Settings if a different USB device
+    needs a different one.
+    """
+
+    alsa_device: str
+    volume_pct: int = 100
+    target_sample_rate_hz: int = 32_000
+    _proc: asyncio.subprocess.Process | None = field(default=None, init=False, repr=False)
+    _resample_state: Any = field(default=None, init=False, repr=False)
+    _resample_src_rate: int = field(default=0, init=False)
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
+
+    async def warm_up(self) -> None:
+        """Push the ALSA mixer to max before the first utterance — see
+        `_set_max_volume`'s docstring for why this probes control names
+        instead of assuming one."""
+        try:
+            await self._set_max_volume()
+            _LOG.info("usb_speaker.warmed_up device=%s", self.alsa_device)
+        except Exception as exc:  # noqa: BLE001 — best effort only
+            _LOG.warning("usb_speaker.warm_up_failed: %s", exc)
+
+    async def _set_max_volume(self) -> None:
+        """Set every simple mixer control this device exposes to max/unmuted.
+
+        Different USB audio devices name their volume control differently
+        (`Speaker`, `PCM`, `Master`, ...) — rather than guess one name and
+        silently do nothing on hardware that uses another, ask ALSA what
+        controls actually exist (`amixer scontrols`) and set all of them.
+        Harmless no-op for any control that doesn't take a plain percentage
+        (amixer just errors on that one control, everything else still gets
+        applied).
+        """
+        list_proc = await asyncio.create_subprocess_exec(
+            "amixer",
+            "-D",
+            self.alsa_device,
+            "scontrols",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await list_proc.communicate()
+        control_names = re.findall(r"'([^']+)'", stdout.decode("utf-8", "replace"))
+        for name in control_names:
+            set_proc = await asyncio.create_subprocess_exec(
+                "amixer",
+                "-D",
+                self.alsa_device,
+                "sset",
+                name,
+                f"{self.volume_pct}%",
+                "unmute",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await set_proc.wait()
+
+    async def play(self, pcm: bytes, *, sample_rate_hz: int) -> None:
+        async with self._lock:
+            proc = await self._ensure_proc()
+            assert proc.stdin is not None  # noqa: S101 — PIPE requested in _ensure_proc
+            try:
+                # Resample to the rate this device actually clocks correctly
+                # (see the class docstring) BEFORE upmixing to stereo — order
+                # matters: audioop.ratecv assumes mono here (nchannels=1),
+                # matching Gemini's real mono output.
+                resampled = self._resample(pcm, sample_rate_hz)
+                # 2026-09-06 audit finding, confirmed live on this exact R1's
+                # Jabra Speak2 40 MS: its playback substream advertises a
+                # FIXED `CHANNELS: 2` (not a range) — `aplay -D hw:MS,0 -c 1`
+                # fails outright with "Channels count non available" before
+                # ever playing a sample, so USB speaker output silently never
+                # worked on this hardware at all. Gemini's audio is mono;
+                # duplicating it onto both channels (audioop.tostereo, gain
+                # 1.0/1.0 — a plain copy, not a mix-down) is the universally
+                # safe fix, not just a fix for this one device: stereo is
+                # supported by virtually every USB audio device, including
+                # ones that also happen to accept true mono.
+                proc.stdin.write(audioop.tostereo(resampled, _SAMPLE_WIDTH_BYTES, 1.0, 1.0))
+                await proc.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                # aplay died mid-utterance (device unplugged, busy, etc.) —
+                # log and drop this chunk; the NEXT play() call spawns a
+                # fresh process instead of writing into a dead pipe forever.
+                _LOG.warning("usb_speaker.aplay_died device=%s", self.alsa_device)
+                self._proc = None
+
+    def _resample(self, pcm: bytes, sample_rate_hz: int) -> bytes:
+        if sample_rate_hz == self.target_sample_rate_hz:
+            return pcm
+        if sample_rate_hz != self._resample_src_rate:
+            self._resample_state = None
+            self._resample_src_rate = sample_rate_hz
+        converted, self._resample_state = audioop.ratecv(
+            pcm, _SAMPLE_WIDTH_BYTES, 1, sample_rate_hz, self.target_sample_rate_hz, self._resample_state
+        )
+        return converted
+
+    async def _ensure_proc(self) -> asyncio.subprocess.Process:
+        # No rate argument any more: play() always resamples to
+        # target_sample_rate_hz before this process ever sees the bytes, so
+        # unlike before, the source rate changing mid-session no longer
+        # means restarting aplay — this process's own declared rate is
+        # constant for the life of this UsbSpeaker.
+        if self._proc is not None:
+            return self._proc
+        self._proc = await asyncio.create_subprocess_exec(
+            "aplay",
+            "-D",
+            self.alsa_device,
+            "-f",
+            "S16_LE",
+            "-r",
+            str(self.target_sample_rate_hz),
+            # "2", not "1": see play()'s comment on audioop.tostereo — the
+            # bytes written to this process's stdin are always upmixed to
+            # stereo before they get here, to match.
+            "-c",
+            "2",
+            "-t",
+            "raw",
+            "-q",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        return self._proc
+
+    async def stop(self) -> None:
+        """Cut playback now — barge-in or the operator's "Замолчи".
+
+        Audit finding, 2026-09-06: this used to go `async with self._lock`
+        straight into `_terminate()`, same as everything else here — but
+        `play()` holds that SAME lock across `stdin.write()` +
+        `await stdin.drain()`, and `drain()` can block for an arbitrary
+        time on backpressure (a stalled `aplay`/ALSA buffer, the exact
+        situation a barge-in is trying to cut short). Waiting for the lock
+        first would mean waiting out the very audio being interrupted —
+        the identical trap `RobotSpeaker.stop()` already avoids with its
+        epoch flag (see that class). Fix here: terminate the process
+        immediately, lock-free — `play()`'s in-flight write/drain then
+        fails fast with BrokenPipeError (already handled below) once the
+        child dies, which is what lets the lock become available promptly
+        for the cleanup/reap that follows.
+        """
+        proc = self._proc
+        if proc is not None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.terminate()
+        async with self._lock:
+            await self._terminate()
+
+    async def _terminate(self) -> None:
+        if self._proc is None:
+            return
+        proc = self._proc
+        self._proc = None
+        with contextlib.suppress(ProcessLookupError):
+            proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=2.0)
+            return
+        except TimeoutError:
+            pass
+        _LOG.warning("usb_speaker.sigterm_ignored device=%s escalating_to_sigkill", self.alsa_device)
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(proc.wait(), timeout=2.0)
 
 
 class HalfDuplexGate:

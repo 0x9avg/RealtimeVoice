@@ -26,6 +26,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import time
 from collections import deque
 from collections.abc import AsyncIterator, Callable
 from typing import Any
@@ -46,12 +47,13 @@ from app.gemini_live import (
     Transcript,
     TurnComplete,
 )
-from app.presence import PresenceRunner
-from app.robot_audio import HalfDuplexGate, RobotMic, RobotSpeaker, UsbMic
+from app.presence import PresenceRunner, build_motion_detector
+from app.robot_audio import HalfDuplexGate, RobotMic, RobotSpeaker, UsbMic, UsbSpeaker
 from app.robot_mic_state import robot_mic_state
 from app.scenarios import INTAKE_RESUME_MARKER, PRESENCE_MARKER
 from app.tool_registry import build_tool_registry
 from app.tools import ToolResult
+from app.wake_word import WakeWordDetector
 
 _LOG = logging.getLogger("session_hub")
 
@@ -84,39 +86,121 @@ class SessionHub:
         # is recognisable as a reconnect (see _handle_event) rather than the
         # first connection of the process.
         self._connected_before = False
-        # "robot": play Gemini's audio through the real robot speaker instead
-        # of streaming it to browsers. See app/config.py's AUDIO_OUTPUT.
-        self.speaker = (
-            RobotSpeaker(
+        # "robot"/"usb": play Gemini's audio through real hardware instead of
+        # streaming it to browsers. See app/config.py's AUDIO_OUTPUT.
+        #
+        # Both hardware targets are constructed (not just the configured
+        # default) whenever this deployment is in hardware-output mode at
+        # all, so an operator can switch between them at runtime without a
+        # restart — see handle_audio_output below and the `speaker`
+        # property, which is what every OTHER method in this class actually
+        # reads/awaits (self.speaker.play(...) etc.), so nothing downstream
+        # needed to change to support the toggle. Constructing both is
+        # cheap: RobotSpeaker only touches DDS/unitree_sdk2py lazily, on its
+        # first real play(); UsbSpeaker only spawns `aplay` on its first
+        # real play() too.
+        self._speakers: dict[str, RobotSpeaker | UsbSpeaker] = {}
+        if settings.audio_output in ("robot", "usb"):
+            self._speakers["robot"] = RobotSpeaker(
                 network_interface=settings.robot_speaker_network_interface,
                 volume_pct=settings.robot_speaker_volume_pct,
             )
-            if settings.audio_output == "robot"
-            else None
+            if settings.usb_speaker_alsa_device:
+                self._speakers["usb"] = UsbSpeaker(
+                    alsa_device=settings.usb_speaker_alsa_device,
+                    volume_pct=settings.usb_speaker_volume_pct,
+                    target_sample_rate_hz=settings.usb_speaker_sample_rate_hz,
+                )
+        # AUDIO_OUTPUT picks the INITIAL target; "browser" (the default)
+        # means neither hardware target was constructed above, so this is
+        # None, same as before this toggle existed.
+        self._active_speaker_target: str | None = (
+            settings.audio_output
+            if settings.audio_output in self._speakers
+            else next(iter(self._speakers), None)
         )
-        # "robot": stream the real head-mic multicast into the session
-        # instead of any one browser's mic button. See AUDIO_INPUT.
-        self.mic = (
-            RobotMic(
+        # "robot"/"usb": read mic audio from real hardware instead of any
+        # one browser's mic button. See app/config.py's AUDIO_INPUT.
+        #
+        # Both hardware sources are constructed (not just the configured
+        # default) whenever this deployment is in hardware-input mode at
+        # all, exactly mirroring `_speakers` above — so an operator can
+        # switch which one is listened to at runtime, from the website, with
+        # no restart and no `.env` edit (2026-09-06 ask, explicit: "и
+        # микрофон с динамиком выбирается не посредством .env файла, а
+        # напрямую на сайте"). See `_preferred_mic_input`/
+        # `set_preferred_mic_input` below for the actual selection —
+        # constructing both here is cheap and side-effect-free (RobotMic/
+        # UsbMic only touch the network/spawn `arecord` lazily, inside their
+        # own `stream()`, called from `_robot_mic_task`/`_usb_mic_task`).
+        self.mic: RobotMic | None = None
+        self.usb_mic: UsbMic | None = None
+        if settings.audio_input in ("robot", "usb"):
+            self.mic = RobotMic(
                 multicast_group=settings.robot_mic_multicast_group,
                 multicast_port=settings.robot_mic_multicast_port,
                 interface_ip=settings.robot_mic_interface_ip,
                 input_channels=settings.robot_mic_input_channels,
             )
-            if settings.audio_input == "robot"
-            else None
-        )
-        # Optional third mic choice, independent of AUDIO_INPUT above — see
-        # app/config.py's usb_mic_alsa_device and app/robot_audio.py's UsbMic.
-        self.usb_mic = (
-            UsbMic(alsa_device=settings.usb_mic_alsa_device)
-            if settings.usb_mic_alsa_device
-            else None
-        )
+            if settings.usb_mic_alsa_device:
+                self.usb_mic = UsbMic(alsa_device=settings.usb_mic_alsa_device)
         self.gate = (
             HalfDuplexGate(guard_s=settings.robot_post_speech_guard_ms / 1000.0)
             if self.mic is not None or self.usb_mic is not None
             else None
+        )
+        # Item 5 of the 2026-09-04 fixes list: the hardware mic used to
+        # forward EVERYTHING it heard to Gemini all day, all the time. Now
+        # it only forwards during a "wake window" — opened by a local
+        # wake-word hit (app/wake_word.py) or a manual override
+        # (handle_mic_source, repurposed from its old "pick a source and
+        # press Start" meaning — see that method's docstring), and extended
+        # by each robot turn so an ongoing conversation doesn't need
+        # re-waking every utterance. See _drain_hw_mic for where this is
+        # read/written; monotonic time, 0.0 (never) until first opened.
+        self._wake_active_until: float = 0.0
+        # Per-SOURCE detector instances, not one shared between them — each
+        # owns its own internal audio buffer (see app/wake_word.py). Sharing
+        # one instance used to let two concurrently-running mic tasks (both
+        # still idle, neither having triggered yet) interleave calls to the
+        # same detector's feed() across an `await` point inside it,
+        # splicing bytes from two unrelated physical microphones into one
+        # buffer — audit finding, 2026-09-06, alongside the closely related
+        # _hw_mic_owns_wake_window fix below (that one stops a triggered
+        # source's audio doubling up with another's; this stops their
+        # PRE-trigger detection from corrupting each other in the first
+        # place). Only built for sources that actually exist here.
+        self._wake_detectors: dict[str, WakeWordDetector] = {}
+        if settings.wake_word_enabled:
+            if self.mic is not None:
+                self._wake_detectors["robot"] = WakeWordDetector(
+                    phrases=settings.wake_word_phrases,
+                    language=settings.wake_word_language,
+                    model_name=settings.wake_word_whisper_model,
+                    window_s=settings.wake_word_window_s,
+                )
+            if self.usb_mic is not None:
+                self._wake_detectors["usb"] = WakeWordDetector(
+                    phrases=settings.wake_word_phrases,
+                    language=settings.wake_word_language,
+                    model_name=settings.wake_word_whisper_model,
+                    window_s=settings.wake_word_window_s,
+                )
+        # Which ONE of the sources in `_wake_detectors` is actually allowed
+        # to run wake-word detection right now — 2026-09-06 ask: "разделения
+        # и параллельного слушания не должно быть... оператор сам выбирает".
+        # AUDIO_INPUT only picks the INITIAL preference (so a fresh process
+        # starts in a sane state); `set_preferred_mic_input` below changes it
+        # live, from the website, without touching `.env` or restarting —
+        # both mic tasks keep running underneath either way (see `self.mic`/
+        # `self.usb_mic` above), only their audio's fate differs: the
+        # preferred source's feeds the wake-word detector and can open the
+        # window; the other's is read (so switching is instant, no cold
+        # `arecord`/socket start) and immediately discarded.
+        self._preferred_mic_input: str | None = (
+            settings.audio_input
+            if settings.audio_input in self._wake_detectors
+            else next(iter(self._wake_detectors), None)
         )
         # One-shot "stop talking now" for the CURRENT turn (see handle_mute)
         # — shared, since there's one speaker/one set of browsers to silence.
@@ -141,6 +225,19 @@ class SessionHub:
         self._last_tool_name: str | None = None
         self._last_tool_text = ""
         self._model_turn_fragments: list[str] = []
+
+    @property
+    def speaker(self) -> RobotSpeaker | UsbSpeaker | None:
+        """Whichever hardware speaker (if any) is CURRENTLY the audio-output
+        target — see _speakers/_active_speaker_target above and
+        handle_audio_output below. A property, not a plain attribute, so
+        every other method here (_drain_speaker, warm_up, mute, ...) always
+        reads the live selection without needing to know a runtime toggle
+        exists at all.
+        """
+        if self._active_speaker_target is None:
+            return None
+        return self._speakers.get(self._active_speaker_target)
 
     # -- lifecycle (app/main.py's lifespan calls these once) -------------
 
@@ -178,10 +275,11 @@ class SessionHub:
                 )
             )
         if self.settings.presence_enabled:
+            # Deliberately NOT self._supervised(): see _presence_task's own
+            # docstring for why a presence bug must never os._exit(1) the
+            # whole robot the way a dead mic/speaker task correctly does.
             self._tasks.append(
-                asyncio.create_task(
-                    self._supervised(self._presence_task, "presence"), name="session-hub-presence"
-                )
+                asyncio.create_task(self._presence_task(), name="session-hub-presence")
             )
         # Not supervised: a best-effort warm-up, not a lifetime loop.
         self._tool_tasks.add(asyncio.create_task(self._warm_up(), name="session-hub-warmup"))
@@ -196,8 +294,22 @@ class SessionHub:
         needed for correctness here — this just moves the wait to a moment
         when nobody is standing in front of the robot.
         """
-        if self.speaker is not None:
-            await self.speaker.warm_up()
+        # Warm up EVERY constructed hardware speaker, not just the currently
+        # active one — an operator can switch targets at runtime
+        # (handle_audio_output) without a restart, and the whole point of
+        # warming up ahead of time is that the first utterance after a
+        # switch shouldn't pay this cost either.
+        for speaker in self._speakers.values():
+            await speaker.warm_up()
+        # UX audit finding, 2026-09-06: without this, the first wake-word
+        # check of the process's life (usually a visitor's very first
+        # "робот" of the day) paid the full faster-whisper model-load cost
+        # inline — see WakeWordDetector.warm_up's docstring.
+        for detector in self._wake_detectors.values():
+            try:
+                await detector.warm_up()
+            except Exception as exc:  # noqa: BLE001 — best effort only
+                _LOG.warning("session_hub.wake_word_warm_up_failed: %s", exc)
         try:
             await knowledge_base.ensure_fresh()
         except Exception as exc:  # noqa: BLE001 — best effort only
@@ -280,6 +392,19 @@ class SessionHub:
             "robot_mic_active": robot_mic_state.active_source == "robot",
             "usb_mic": self.usb_mic is not None,
             "usb_mic_active": robot_mic_state.active_source == "usb",
+            # Which hardware mic is currently PREFERRED for wake-word
+            # listening — 2026-09-06 ask: chosen live from the website, not
+            # `.env` (see set_preferred_mic_input below). Distinct from the
+            # *_active fields above, which reflect the momentary "is a wake
+            # window open right now" state: this is the standing choice of
+            # which source is even allowed to try in the first place.
+            "preferred_mic_input": self._preferred_mic_input,
+            # Hardware speaker OUTPUT targets — item 2 of the 2026-09-05
+            # fixes list. Same shape/idea as the mic fields above: which
+            # targets exist on this process, and which one is currently
+            # active (see handle_audio_output/the `speaker` property).
+            "speaker_targets": list(self._speakers.keys()),
+            "active_speaker_target": self._active_speaker_target,
         }
 
     def leave(self, ws: WebSocket) -> None:
@@ -341,27 +466,96 @@ class SessionHub:
         await self.adapter.send_audio(pcm)
 
     async def handle_mic_source(self, source: str) -> None:
-        # Any subscriber choosing a hardware source (or away from one) is an
-        # explicit operator action on the robot's actual hardware, not just
-        # that one tab's input routing — see app/robot_mic_state.py. Only
-        # ever selects a source that's actually configured on this process;
-        # "robot"/"usb" requested for a source that doesn't exist here is a
-        # no-op (leaves whatever was active before untouched), same as
-        # before this method knew about more than one hardware source.
+        """Manual override for the hardware mic's wake state.
+
+        Before item 5 of the 2026-09-04 fixes list, this was "pick a source
+        and press Start" — the hardware mic forwarded everything, all the
+        time, once selected. Now the hardware mic (if configured) is always
+        locally listening for the wake word (app/wake_word.py) and only
+        forwards to Gemini during the resulting window — there is nothing
+        left to "start" in the old sense. This method is now a manual
+        override for that same window, useful for an operator who wants the
+        robot listening right now without saying the wake phrase (a demo, a
+        noisy room, testing): "robot"/"usb" opens the window immediately for
+        that source (only if it's actually configured here — a request for a
+        source that doesn't exist is a no-op); "browser"/"none" closes it
+        early (an explicit "go back to sleep", separate from — and stronger
+        than — waiting out the window's own timeout).
+        """
+        now = time.monotonic()
         if source == "robot" and self.mic is not None:
+            self._wake_active_until = now + self.settings.wake_active_window_s
             robot_mic_state.active_source = "robot"
         elif source == "usb" and self.usb_mic is not None:
+            self._wake_active_until = now + self.settings.wake_active_window_s
             robot_mic_state.active_source = "usb"
         elif source in ("browser", "none"):
+            self._wake_active_until = 0.0
             robot_mic_state.active_source = "browser"
         else:
             return
-        _LOG.info("robot_mic_state.active_source -> %s", robot_mic_state.active_source)
+        _LOG.info("robot_mic_state.active_source -> %s (manual override)", robot_mic_state.active_source)
         # Push the new state to every ALREADY-open tab, not just future
         # joiners — without this, a second operator's tab kept showing
         # "listening (robot mic)" (or the wrong source entirely) forever
         # after someone else switched it elsewhere, since it had no way to
         # learn the shared hardware state changed out from under it.
+        await self._broadcast_json(self._capabilities_message())
+
+    async def handle_audio_output(self, target: str) -> None:
+        """Runtime toggle between hardware speaker targets — item 2 of the
+        2026-09-05 fixes list ("добавь возможность выбора вывода звука
+        (внешний usb динамик, внутренний)"). Only switches to a target
+        that's actually configured here (see _speakers in __init__); a
+        request for one that doesn't exist, or the one already active, is a
+        no-op — same convention as handle_mic_source.
+
+        Stops the OLD speaker explicitly, in this order, BEFORE flipping
+        _active_speaker_target — the `speaker` property always resolves to
+        whichever target is currently active, so stopping it AFTER the flip
+        would silence the just-selected NEW speaker instead of cutting off
+        whatever the old one still had queued/in flight.
+        """
+        if target not in self._speakers or target == self._active_speaker_target:
+            return
+        old_speaker = self.speaker
+        while True:
+            try:
+                self._speaker_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        if old_speaker is not None:
+            await old_speaker.stop()
+        self._active_speaker_target = target
+        if self.gate is not None:
+            self.gate.on_speaking_stopped()
+        _LOG.info("session_hub.audio_output -> %s", target)
+        await self._broadcast_json(self._capabilities_message())
+
+    async def set_preferred_mic_input(self, source: str) -> None:
+        """Runtime choice of WHICH hardware mic is allowed to listen for the
+        wake word — 2026-09-06 ask, explicit: "микрофон... выбирается не
+        посредством .env файла, а напрямую на сайте". Mirrors
+        `handle_audio_output` above: both hardware mics are always
+        constructed together (see `self.mic`/`self.usb_mic` in `__init__`),
+        so switching here is instant — no restart, no cold `arecord`/socket
+        start, no `.env` edit. Only switches to a source that's actually
+        configured here (see `_wake_detectors`); a request for one that
+        doesn't exist, or the one already preferred, is a no-op — same
+        convention as handle_mic_source/handle_audio_output.
+
+        If the OLD preferred source currently owns an open wake window,
+        that window is closed immediately — otherwise it would keep
+        forwarding audio from a mic the operator just said to stop
+        listening to until its timeout ran out on its own.
+        """
+        if source not in self._wake_detectors or source == self._preferred_mic_input:
+            return
+        self._preferred_mic_input = source
+        if robot_mic_state.active_source not in (source, "browser"):
+            robot_mic_state.active_source = "browser"
+            self._wake_active_until = 0.0
+        _LOG.info("session_hub.preferred_mic_input -> %s", source)
         await self._broadcast_json(self._capabilities_message())
 
     async def handle_mute(self) -> None:
@@ -564,9 +758,20 @@ class SessionHub:
                 async for pcm in open_stream():
                     streamed_anything = True
                     backoff_s = 1.0  # streaming again — forget any prior failure
-                    if robot_mic_state.active_source != source:
-                        continue
                     if self.gate is not None and self.gate.mic_muted:
+                        # Also skip wake-word detection here, not just
+                        # forwarding — otherwise the robot's own voice
+                        # coming back through the mic (no AEC on this
+                        # hardware, see HalfDuplexGate) could self-trigger
+                        # the wake word.
+                        continue
+                    if source in self._wake_detectors:
+                        if not await self._hw_mic_owns_wake_window(source, pcm):
+                            continue
+                    elif robot_mic_state.active_source != source:
+                        # No wake-word model loaded (WAKE_WORD_ENABLED=false)
+                        # — fall back to the old manual-selection gate so
+                        # this source isn't a silent no-op.
                         continue
                     await self.adapter.send_audio(pcm)
                 _LOG.warning(
@@ -593,23 +798,141 @@ class SessionHub:
             await asyncio.sleep(backoff_s)
             backoff_s = min(backoff_s * 2, 30.0)
 
+    async def _hw_mic_owns_wake_window(self, source: str, pcm: bytes) -> bool:
+        """Wake-word gate for ONE hardware source — whether the CALLER
+        should still forward `pcm` (already known not to be gate-muted)
+        itself. Returns False both when the window isn't open at all AND
+        on the exact call where a wake hit just fired — in that second
+        case this method has already forwarded the detector's buffered
+        lead-up (which ends with `pcm`) itself; see the "recent_audio"
+        replay below for why the caller must not also send `pcm` again.
+
+        Audit finding, 2026-09-06: `_wake_active_until` is ONE timer shared
+        by every `_drain_hw_mic` task (there's only one active conversation
+        at a time, not one per source) — but if BOTH a built-in AND a USB
+        mic are configured simultaneously, checking only "is the window
+        open" here let EITHER source's task treat an open window as license
+        to forward, regardless of which source actually opened it. Saying
+        the wake word into ONE mic used to make BOTH start streaming to
+        Gemini at once — exactly the "two sources feeding Gemini
+        simultaneously" outcome app/robot_mic_state.py's docstring already
+        warns the exclusive `active_source` field exists to prevent. This
+        method is the fix: a source may only ride an open window, or open a
+        new one, while `robot_mic_state.active_source` is either itself or
+        "browser" (idle) — never while a DIFFERENT source currently owns it.
+
+        UX audit finding, 2026-09-06: `wake_active_window_s` (12s default)
+        is tuned for ordinary conversational back-and-forth, but the G1
+        visit-intake interview can have a visitor pause well past that —
+        recalling an ID number, digging a pass out of a bag — and the
+        window used to expire right under them mid-registration: their
+        eventual answer was silently dropped and they had to say the wake
+        phrase again with no indication why, in the middle of a formal
+        registration flow where that reads as the robot malfunctioning, not
+        as expected behaviour. While a visit-intake interview is actively
+        engaged (app/visit_intake.py), the window this source already owns
+        simply never expires — see `intake_keeps_awake` below — so a slow
+        answer is still heard whenever it comes. Ordinary conversation
+        outside an interview keeps the normal 12s timeout.
+        """
+        now = time.monotonic()
+        intake_tool = self._intake_tool()
+        intake_keeps_awake = intake_tool is not None and getattr(intake_tool, "engaged", False)
+        is_awake = intake_keeps_awake or now < self._wake_active_until
+        owns_window = robot_mic_state.active_source == source
+        if is_awake:
+            return owns_window  # someone else's turn -- stay silent, don't even feed
+        if owns_window:
+            # The window we owned just expired -- go back to sleep. (Only
+            # the owning source ever makes this transition; the others were
+            # already excluded by `owns_window` being False for them.)
+            robot_mic_state.active_source = "browser"
+            await self._broadcast_json(self._capabilities_message())
+            return False
+        if robot_mic_state.active_source not in (source, "browser"):
+            return False  # a different source has the floor -- don't even try to wake
+        if source != self._preferred_mic_input:
+            # 2026-09-06 ask: "разделения и параллельного слушания не
+            # должно быть... оператор сам выбирает". Both hardware mics'
+            # background tasks run regardless (see __init__ — that's what
+            # makes switching instant), but only the PREFERRED one may ever
+            # run wake-word inference. Without this, a robot with both a
+            # built-in AND a USB mic configured would run faster-whisper
+            # TWICE, once per source, racing to see which "wins" — wasted
+            # CPU and an ambiguous answer to "which mic actually wakes it".
+            return False
+        # await, not a plain call: WakeWordDetector.feed runs real Whisper
+        # inference off-thread (see its docstring) — this suspends only
+        # THIS task while that runs, the event loop keeps serving everyone
+        # else.
+        detector = self._wake_detectors[source]
+        if not await detector.feed(pcm):
+            return False
+        self._wake_active_until = time.monotonic() + self.settings.wake_active_window_s
+        robot_mic_state.active_source = source
+        _LOG.info("session_hub.wake_word_detected source=%s", source)
+        await self._broadcast_json(self._capabilities_message())
+        # 2026-09-06 audit finding (prompted by a direct question: "won't
+        # the robot miss the beginning of the sentence?"): feed() needs a
+        # full window_s-second buffer to even attempt a check, so the wake
+        # phrase itself -- and whatever the visitor said in the same
+        # breath right up to this instant -- was ALREADY spoken by the
+        # time this fires. Forwarding only `pcm` (the single ~50ms chunk
+        # being fed right now, as the caller normally would) meant Gemini
+        # never heard any of that: only the tail end onward. Replaying the
+        # detector's own sliding buffer (see WakeWordDetector.recent_audio)
+        # recovers it -- it already ends with `pcm`, so returning False
+        # here (not True) tells the caller NOT to also forward `pcm`
+        # itself, which would otherwise repeat that one trailing chunk.
+        await self.adapter.send_audio(detector.recent_audio)
+        return False
+
     async def _presence_task(self) -> None:
         """Greets a visitor once they appear (R1 ТЗ §4.1 / G1 ТЗ §3.1). One
         instance for the whole process — previously this ran once PER
         connected browser tab, so a visitor could be greeted multiple times
-        if more than one tab happened to be open."""
+        if more than one tab happened to be open.
+
+        Runs its own true-infinite-loop retry-with-backoff (same contract
+        `_supervised`'s other tasks rely on it enforcing for THEM) instead
+        of being wrapped by `_supervised` itself: presence is a
+        supplementary feature layered on the voice pipeline (2026-09-06 UX
+        ask called it "скорее дополнение", not core), not a hardware I/O
+        path like the mic/speaker tasks that the robot is genuinely unusable
+        without. Motion scoring itself already runs out-of-process by
+        default (`PRESENCE_ISOLATION=process` — see app/presence.py's
+        SubprocessMotionDetector, which never raises out of score() at all,
+        it just respawns and reports 0.0 for that frame) — this catch-all is
+        the second, outer layer of the same isolation goal: whatever else
+        could go wrong here (camera_hub itself raising, say) must cost this
+        loop a retry, never the whole robot going silently mute.
+        """
 
         async def on_visitor_detected() -> None:
             _LOG.info("presence.visitor_detected")
             await self.adapter.send_text(PRESENCE_MARKER)
 
-        runner = PresenceRunner(
-            frames=sampled(camera_hub, fps=self.settings.presence_fps),
-            on_visitor_detected=on_visitor_detected,
-            threshold=self.settings.presence_threshold,
-            rearm_s=self.settings.presence_rearm_s,
-        )
-        await runner.run()
+        backoff_s = 1.0
+        while True:
+            detector = build_motion_detector(self.settings.presence_isolation)
+            try:
+                runner = PresenceRunner(
+                    frames=sampled(camera_hub, fps=self.settings.presence_fps),
+                    on_visitor_detected=on_visitor_detected,
+                    detector=detector,
+                    threshold=self.settings.presence_threshold,
+                    rearm_s=self.settings.presence_rearm_s,
+                )
+                await runner.run()
+                _LOG.warning("presence.runner_ended_unexpectedly")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _LOG.exception("presence.task_error")
+            finally:
+                await detector.aclose()
+            await asyncio.sleep(backoff_s)
+            backoff_s = min(backoff_s * 2, 30.0)
 
     async def _pump_gemini(self) -> None:
         """Consume adapter events for the life of the process.
@@ -679,6 +1002,14 @@ class SessionHub:
                 self._last_tool_text = ""
                 self._model_turn_fragments = []
                 self.muted = False
+                # Extend (not open) the hardware mic's wake window — a
+                # visitor mid-conversation shouldn't have to repeat the wake
+                # phrase before every follow-up question. Only extends an
+                # ALREADY-open window (never opens one fresh here): a turn
+                # driven entirely by the browser/operator panel must not
+                # wake the physical mic up on its own.
+                if self._wake_active_until > 0:
+                    self._wake_active_until = time.monotonic() + self.settings.wake_active_window_s
                 await self._broadcast_json({"type": "turn_complete"})
             case Interrupted():
                 # Barge-in: drop everything still queued and cut the audio

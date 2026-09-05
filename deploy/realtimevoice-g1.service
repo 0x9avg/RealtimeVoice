@@ -23,15 +23,14 @@ Environment=CYCLONEDDS_URI=%h/cyclonedds_ws/cyclonedds.xml
 # python-dotenv's load_dotenv() does not override an already-set process
 # environment variable by default (see app/config.py).
 Environment=ROBOT_PROFILE=g1
-# Port convention for this project: R1 always listens on 8000
-# (deploy/realtimevoice-r1.service), G1 always on 8001 — fixed, not just for
-# the same-host testbed case DEPLOYMENT.md §6 describes. Keeping them
-# distinct even though R1 and G1 are normally separate physical robots (so
-# there's rarely a literal port clash) makes "which robot is this" obvious
-# from the URL alone, and means the two units never accidentally collide if
-# they ever DO end up reachable through the same address (e.g. a shared
-# jump host, a NAT/port-forward setup, or a same-host test bench).
-ExecStart=%h/.local/bin/uv run uvicorn app.main:app --host 0.0.0.0 --port 8001
+# 2026-09-06: reverted to the same port as R1 (8000), by explicit request --
+# R1 and G1 are separate physical robots at different addresses, so there's
+# no actual clash; the previous 8000/8001 split (making "which robot" visible
+# from the port alone, and guarding against the two ever sharing one address
+# via a jump host/NAT) is no longer wanted. If R1 and G1 are ever run on the
+# SAME host again (a test bench), override --port here manually -- the units
+# no longer do it for you.
+ExecStart=%h/.local/bin/uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
 Restart=on-failure
 RestartSec=3
 # Covers both a clean crash AND a hung process (a stuck DDS/vendor-SDK call

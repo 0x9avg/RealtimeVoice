@@ -1,7 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { getAuthToken, notifyUnauthorized } from "../api/client";
-
 // NEW — not ported from humanoid-robot. That dashboard's chat
 // (useConversation.ts + eventStream.tsx) streams answers over a NATS-style
 // event bus keyed by session_id, driven by a separate camera feed and
@@ -14,58 +12,58 @@ export interface TranscriptLine {
   text: string;
 }
 
-export type MicSource = "browser" | "robot" | "usb" | "none";
+// Item 5 of the 2026-09-04 fixes list: the hardware mic (robot/usb) is no
+// longer something an operator "starts" — if configured, it's always
+// locally listening for the wake word (app/wake_word.py) and only forwards
+// to Gemini during the resulting window. "HwMicSource" here names WHICH
+// hardware source is currently in that window (server truth, mirrored, not
+// something this tab decides) — "browser" mic capture is a separate,
+// genuinely per-tab, operator-actionable thing (see browserMicActive below).
+export type HwMicSource = "robot" | "usb" | null;
 
-// Persists only the DROPDOWN pick ("browser"/"robot"/"usb"), not whether the
-// mic is actually active. The active hardware mic itself is already global
-// and restored from the server on every connect (app/session_hub.py's
-// capabilities message, mirrored below) — this is only for the case that
-// isn't: picking an option in the dropdown but not pressing Start, which had
-// nothing backing it server-side and silently reverted to "Микрофон
-// браузера" on every reload.
-const _MIC_SOURCE_STORAGE_KEY = "realtimevoice.micSource";
+// Item 2 of the 2026-09-05 fixes list: which hardware speaker OUTPUT target
+// is active — a runtime toggle now (app/session_hub.py's
+// handle_audio_output), not a fixed AUDIO_OUTPUT chosen once at deploy time.
+export type SpeakerTarget = "robot" | "usb" | null;
 
-function readStoredMicSource(): MicSource {
-  try {
-    const stored = localStorage.getItem(_MIC_SOURCE_STORAGE_KEY);
-    if (stored === "browser" || stored === "robot" || stored === "usb") return stored;
-  } catch {
-    // localStorage unavailable (private mode, blocked site data) — fall
-    // back to the default below, same as a first-ever visit.
-  }
-  return "browser";
-}
-
-function persistMicSource(source: MicSource): void {
-  try {
-    // "none" is a wire-only value (see stopMic) — never a dropdown option,
-    // so there's nothing meaningful to remember for it.
-    if (source === "none") return;
-    localStorage.setItem(_MIC_SOURCE_STORAGE_KEY, source);
-  } catch {
-    // Same as above — a lost preference is a minor inconvenience, not
-    // worth surfacing to the user.
-  }
-}
+// 2026-09-06 audit finding: this hook's own `status` string is ALSO used
+// verbatim for the server-relayed Gemini connection lifecycle ("status"
+// messages mirror app/gemini_live.py's ConnectionStateChanged — see
+// app/session_hub.py's _pump_gemini), which routinely goes through
+// "closed" every ~max_session_duration_s minutes as part of a normal,
+// inaudible proactive session swap. Reusing the same field/string for
+// "this BROWSER TAB's own WebSocket to our backend died" would make a
+// real network drop indistinguishable from that routine, harmless Gemini
+// housekeeping — so the browser<->backend socket's own lifecycle gets a
+// separate field instead, never touching `status`.
+export type WsConnectionState = "connecting" | "open" | "reconnecting";
 
 export function useVoiceSession() {
   const [status, setStatus] = useState("idle");
-  const [micActive, setMicActive] = useState(false);
-  const [micSource, setMicSourceState] = useState<MicSource>(readStoredMicSource);
+  const [wsConnected, setWsConnected] = useState<WsConnectionState>("connecting");
+  const [browserMicActive, setBrowserMicActive] = useState(false);
   const [robotMicAvailable, setRobotMicAvailable] = useState(false);
   const [usbMicAvailable, setUsbMicAvailable] = useState(false);
+  const [hwMicAwake, setHwMicAwake] = useState<HwMicSource>(null);
+  // 2026-09-06 ask: which hardware mic listens for the wake word is chosen
+  // live from the website, not `.env` — see setMicInput below and
+  // app/session_hub.py's set_preferred_mic_input. Distinct from hwMicAwake
+  // above (the momentary "a wake window is open right now" state): this is
+  // the standing preference, server truth, mirrored here.
+  const [preferredMicInput, setPreferredMicInput] = useState<"robot" | "usb" | null>(null);
+  const [speakerTargets, setSpeakerTargets] = useState<string[]>([]);
+  const [activeSpeakerTarget, setActiveSpeakerTarget] = useState<SpeakerTarget>(null);
   const [transcript, setTranscript] = useState<TranscriptLine[]>([]);
   const [toolLog, setToolLog] = useState<string[]>([]);
 
   const wsRef = useRef<WebSocket | null>(null);
-  // Mirrors `micActive` state for use inside ws.onmessage (see the mount
-  // effect below): that handler is created once, inside a `useEffect(...,
-  // [])`, so any REACT STATE it reads is permanently the value from the
-  // first render (a stale closure) — it must read refs instead for
-  // anything that can change later. Same reason micSourceRef exists
-  // alongside micSource.
-  const micActiveRef = useRef(false);
-  const micSourceRef = useRef<MicSource>(readStoredMicSource());
+  // Mirrors state for use inside ws.onmessage (see the mount effect below):
+  // that handler is created once, inside a `useEffect(..., [])`, so any
+  // REACT STATE it reads is permanently the value from the first render (a
+  // stale closure) — it must read refs instead for anything that can
+  // change later.
+  const browserMicActiveRef = useRef(false);
+  const hwMicAwakeRef = useRef<HwMicSource>(null);
   const captureCtxRef = useRef<AudioContext | null>(null);
   const captureNodeRef = useRef<AudioWorkletNode | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
@@ -124,7 +122,7 @@ export function useVoiceSession() {
     [ensurePlaybackContext],
   );
 
-  const sendMicSourceMessage = useCallback((source: MicSource) => {
+  const sendMicSourceMessage = useCallback((source: "browser" | "robot" | "usb" | "none") => {
     const ws = wsRef.current;
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "mic_source", source }));
@@ -132,147 +130,146 @@ export function useVoiceSession() {
   }, []);
 
   const listeningLabel = useCallback(() => {
-    if (micSourceRef.current === "robot") return "listening (robot mic)";
-    if (micSourceRef.current === "usb") return "listening (usb mic)";
-    return "listening";
+    if (browserMicActiveRef.current) return "listening";
+    if (hwMicAwakeRef.current === "robot") return "listening (robot mic)";
+    if (hwMicAwakeRef.current === "usb") return "listening (usb mic)";
+    return "idle";
   }, []);
 
   useEffect(() => {
-    const protocol = location.protocol === "https:" ? "wss" : "ws";
-    // ?token=... — see app/main.py's /ws/session: a WS handshake can't carry
-    // an Authorization header from browser JS, so this is the only way to
-    // pass the same bearer token the REST calls send. Empty/no token is
-    // fine when the server has no ACCESS_TOKEN configured (app/auth.py's
-    // rule applies here too).
-    const token = getAuthToken();
-    const wsUrl = `${protocol}://${location.host}/ws/session${
-      token ? `?token=${encodeURIComponent(token)}` : ""
-    }`;
-    const ws = new WebSocket(wsUrl);
-    ws.binaryType = "arraybuffer";
-    wsRef.current = ws;
+    let cancelled = false;
+    let reconnectDelayMs = 1000;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
-    ws.onmessage = (event) => {
-      if (event.data instanceof ArrayBuffer) {
-        playChunk(event.data);
-        return;
-      }
-      const message = JSON.parse(event.data);
-      switch (message.type) {
-        case "capabilities": {
-          setRobotMicAvailable(Boolean(message.robot_mic));
-          setUsbMicAvailable(Boolean(message.usb_mic));
-          if (!message.robot_mic && micSourceRef.current === "robot") {
-            micSourceRef.current = "browser";
-            setMicSourceState("browser");
-            persistMicSource("browser");
-          }
-          if (!message.usb_mic && micSourceRef.current === "usb") {
-            micSourceRef.current = "browser";
-            setMicSourceState("browser");
-            persistMicSource("browser");
-          }
-          // Any hardware mic is a GLOBAL switch (app/robot_mic_state.py on
-          // the server, shared across robot/usb) — a previous tab/operator
-          // may have already turned one on, and this fresh connection must
-          // reflect that instead of showing "off" and requiring a redundant
-          // Start click. Nothing to capture locally for this case (the
-          // server reads the actual hardware), so just mirror the UI state.
-          const activeHwSource = message.robot_mic && message.robot_mic_active
-            ? "robot"
-            : message.usb_mic && message.usb_mic_active
-              ? "usb"
-              : null;
-          if (activeHwSource) {
-            micSourceRef.current = activeHwSource;
-            setMicSourceState(activeHwSource);
-            persistMicSource(activeHwSource);
-            micActiveRef.current = true;
-            setMicActive(true);
-            setStatus(activeHwSource === "robot" ? "listening (robot mic)" : "listening (usb mic)");
-          } else if (
-            micActiveRef.current &&
-            (micSourceRef.current === "robot" || micSourceRef.current === "usb")
-          ) {
-            // This tab was ACTIVELY mirroring a hardware mic (micActiveRef,
-            // not just the dropdown pick — see its declaration above) that
-            // JUST got switched off (or to a different source) from
-            // somewhere else. This is a LIVE update (app/session_hub.py's
-            // handle_mic_source now broadcasts it, not just delivers it on
-            // join), not only the initial capabilities on connect. Without
-            // this, a tab kept showing "listening (robot mic)" forever
-            // after another operator turned it off, even though the server
-            // had already stopped forwarding that audio.
-            //
-            // The micActiveRef check matters even though it looks
-            // redundant with the condition above: on a freshly loaded page,
-            // micSourceRef can already be "robot"/"usb" merely because it
-            // was RESTORED from localStorage (the user had it selected, but
-            // never actually pressed Start) — without gating on
-            // micActiveRef too, this branch used to fire for that case as
-            // well and immediately stomp the just-restored selection back
-            // to "browser", which is what made mic-source selection look
-            // like it kept resetting on every page reload.
-            micSourceRef.current = "browser";
-            setMicSourceState("browser");
-            persistMicSource("browser");
-            micActiveRef.current = false;
-            setMicActive(false);
-            setStatus("idle");
-          }
-          break;
+    const connect = () => {
+      const protocol = location.protocol === "https:" ? "wss" : "ws";
+      const wsUrl = `${protocol}://${location.host}/ws/session`;
+      const ws = new WebSocket(wsUrl);
+      ws.binaryType = "arraybuffer";
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        reconnectDelayMs = 1000;
+        setWsConnected("open");
+        // The server treats every new /ws/session connection as a brand
+        // new join, with mic_source reset to "none" (app/main.py's
+        // `session()`) — if this tab's browser mic was already running
+        // when the previous socket dropped, capture keeps going client-
+        // side (startBrowserMic/captureNode are untouched by a WS drop),
+        // but the server has no idea to route it anywhere until told
+        // again on the new connection.
+        if (browserMicActiveRef.current) {
+          ws.send(JSON.stringify({ type: "mic_source", source: "browser" }));
         }
-        case "status":
-          setStatus(message.state);
-          if (message.detail) appendTool(`[status] ${message.state}: ${message.detail}`);
-          break;
-        case "turn_complete":
-          // micActiveRef, not the micActive STATE — this handler lives
-          // inside the mount effect's closure (see micActiveRef's
-          // declaration), so the state value here would always be
-          // whatever it was on the very first render (false), permanently
-          // — every turn_complete after the mic was first started would
-          // read as "not listening" and drop the status back to "idle"
-          // instead of back to "listening" between turns.
-          setStatus(micActiveRef.current ? listeningLabel() : "idle");
-          break;
-        case "interrupted":
-          stopPlayback();
-          setStatus(micActiveRef.current ? listeningLabel() : "idle");
-          break;
-        case "transcript":
-          setTranscript((prev) => [...prev, { role: message.role, text: message.text }]);
-          break;
-        case "tool_call":
-          appendTool(`→ ${message.name}(${JSON.stringify(message.args)})`);
-          break;
-        case "tool_result":
-          appendTool(`← ${message.name}: ${message.text}`);
-          break;
-        case "robot_audio":
-          setStatus("speaking (robot)");
-          break;
-        default:
-          break;
-      }
+      };
+
+      ws.onmessage = (event) => {
+        if (event.data instanceof ArrayBuffer) {
+          playChunk(event.data);
+          return;
+        }
+        const message = JSON.parse(event.data);
+        switch (message.type) {
+          case "capabilities": {
+            setRobotMicAvailable(Boolean(message.robot_mic));
+            setUsbMicAvailable(Boolean(message.usb_mic));
+            // Which hardware source (if any) is CURRENTLY inside its
+            // wake-word window — server truth (app/session_hub.py's
+            // _drain_hw_mic/handle_mic_source), broadcast live on every
+            // transition, not just delivered on join. Purely informational
+            // here: nothing in this tab decided this, it just mirrors it.
+            const awake: HwMicSource = message.robot_mic && message.robot_mic_active
+              ? "robot"
+              : message.usb_mic && message.usb_mic_active
+                ? "usb"
+                : null;
+            if (awake !== hwMicAwakeRef.current) {
+              hwMicAwakeRef.current = awake;
+              setHwMicAwake(awake);
+              if (!browserMicActiveRef.current) setStatus(listeningLabel());
+            }
+            setPreferredMicInput(
+              message.preferred_mic_input === "robot" || message.preferred_mic_input === "usb"
+                ? message.preferred_mic_input
+                : null,
+            );
+            setSpeakerTargets(Array.isArray(message.speaker_targets) ? message.speaker_targets : []);
+            setActiveSpeakerTarget(
+              message.active_speaker_target === "robot" || message.active_speaker_target === "usb"
+                ? message.active_speaker_target
+                : null,
+            );
+            break;
+          }
+          case "status":
+            setStatus(message.state);
+            if (message.detail) appendTool(`[status] ${message.state}: ${message.detail}`);
+            break;
+          case "turn_complete":
+            setStatus(listeningLabel());
+            break;
+          case "interrupted":
+            stopPlayback();
+            setStatus(listeningLabel());
+            break;
+          case "transcript":
+            setTranscript((prev) => [...prev, { role: message.role, text: message.text }]);
+            break;
+          case "tool_call":
+            appendTool(`→ ${message.name}(${JSON.stringify(message.args)})`);
+            break;
+          case "tool_result":
+            appendTool(`← ${message.name}: ${message.text}`);
+            break;
+          case "robot_audio":
+            setStatus("speaking (robot)");
+            break;
+          default:
+            break;
+        }
+      };
+      ws.onclose = () => {
+        wsRef.current = null;
+        if (cancelled) return;
+        // 2026-09-06 audit finding: this used to be the end of it -- no
+        // retry, ever. A dropped browser<->backend socket (a Wi-Fi blip,
+        // routine `systemctl --user restart` during a deploy, the process
+        // supervisor restarting after a crash — all real, documented
+        // occurrences, see DEPLOYMENT.md) left the tab showing a bare
+        // "closed"/"error" string forever, mic/mute buttons silently
+        // inert, with no way for a visitor or operator to tell the
+        // difference between "temporarily reconnecting" and "broken,
+        // reload the page" — indistinguishable from the site having
+        // frozen. Retrying with backoff (capped at 10s) fixes the common
+        // case (the backend comes back within seconds) without a manual
+        // reload; `wsConnected` (separate from `status` — see its own
+        // comment above) drives a "reconnecting" indicator in the UI.
+        setWsConnected("reconnecting");
+        reconnectTimer = setTimeout(connect, reconnectDelayMs);
+        reconnectDelayMs = Math.min(reconnectDelayMs * 2, 10_000);
+      };
+      ws.onerror = () => {
+        // A WebSocket that fails to connect or drops fires "error"
+        // immediately followed by "close" — onclose above owns the actual
+        // reconnect scheduling; this only exists so `wsConnected` doesn't
+        // sit on a stale "open" for the instant between the two events.
+        setWsConnected("reconnecting");
+      };
     };
-    ws.onclose = (event) => {
-      setStatus("closed");
-      // 4401 — app/main.py's /ws/session rejected a missing/wrong token.
-      // Reuse the exact same "show the token prompt" flow a REST 401
-      // triggers, instead of just going silently dark.
-      if (event.code === 4401) notifyUnauthorized();
-    };
-    ws.onerror = () => setStatus("error");
+
+    connect();
 
     return () => {
-      ws.close();
+      cancelled = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      wsRef.current?.close();
       wsRef.current = null;
     };
-    // Intentionally empty deps: one WS per mount, matching the previous
-    // vanilla implementation (no auto-reconnect there either — the
-    // server-side GeminiLiveAdapter reconnects to Gemini on its own, but the
-    // browser socket to our own backend is not retried automatically).
+    // Intentionally empty deps: one mount-lifetime reconnect loop, driven
+    // entirely by `connect`'s own closures — see the "must never touch
+    // status" comment on `wsConnected` above for why this doesn't also
+    // reconnect the Gemini-side "status" messages, which are the
+    // server's business (app/gemini_live.py already retries those).
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -292,7 +289,7 @@ export function useVoiceSession() {
     source.connect(captureNode);
   }, []);
 
-  const stopBrowserMic = useCallback(() => {
+  const stopBrowserMicCapture = useCallback(() => {
     if (captureNodeRef.current) captureNodeRef.current.port.onmessage = null;
     if (micStreamRef.current) micStreamRef.current.getTracks().forEach((t) => t.stop());
     if (captureCtxRef.current) void captureCtxRef.current.close();
@@ -302,42 +299,64 @@ export function useVoiceSession() {
   }, []);
 
   const startMic = useCallback(async () => {
-    const source = micSourceRef.current;
-    if (source === "browser") await startBrowserMic();
-    sendMicSourceMessage(source);
-    micActiveRef.current = true;
-    setMicActive(true);
-    setStatus(listeningLabel());
-  }, [startBrowserMic, sendMicSourceMessage, listeningLabel]);
+    await startBrowserMic();
+    sendMicSourceMessage("browser");
+    browserMicActiveRef.current = true;
+    setBrowserMicActive(true);
+    setStatus("listening");
+  }, [startBrowserMic, sendMicSourceMessage]);
 
   const stopMic = useCallback(() => {
-    micActiveRef.current = false;
-    setMicActive(false);
-    stopBrowserMic();
+    browserMicActiveRef.current = false;
+    setBrowserMicActive(false);
+    stopBrowserMicCapture();
     sendMicSourceMessage("none");
-    setStatus("idle");
-  }, [stopBrowserMic, sendMicSourceMessage]);
+    setStatus(listeningLabel());
+  }, [stopBrowserMicCapture, sendMicSourceMessage, listeningLabel]);
 
-  const setMicSource = useCallback((source: MicSource) => {
-    micSourceRef.current = source;
-    setMicSourceState(source);
-    persistMicSource(source);
+  // Manual override for the hardware mic's wake window (see
+  // app/session_hub.py's handle_mic_source docstring) — for an operator who
+  // wants the robot listening right now without saying the wake phrase.
+  const wakeHwMicNow = useCallback(
+    (source: "robot" | "usb") => sendMicSourceMessage(source),
+    [sendMicSourceMessage],
+  );
+
+  const putHwMicToSleep = useCallback(() => sendMicSourceMessage("browser"), [sendMicSourceMessage]);
+
+  // Runtime toggle between hardware speaker OUTPUT targets — item 2 of the
+  // 2026-09-05 fixes list. See app/session_hub.py's handle_audio_output.
+  const setAudioOutput = useCallback((target: "robot" | "usb") => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "audio_output", target }));
+    }
+  }, []);
+
+  // Runtime toggle between hardware mic INPUT sources for wake-word
+  // listening — 2026-09-06 ask: chosen live from the website, not `.env`.
+  // See app/session_hub.py's set_preferred_mic_input.
+  const setMicInput = useCallback((source: "robot" | "usb") => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "mic_input", source }));
+    }
   }, []);
 
   const mute = useCallback(() => {
     // Local stop first, for an instant cut of whatever's already buffered
     // in this tab — but on its own this only clears past chunks. The rest
     // of the current turn is still in flight from the server (and, in
-    // AUDIO_OUTPUT=robot mode, playing on hardware the browser can't touch
-    // at all), so the server also needs telling to stop forwarding/playing
-    // it — see app/main.py's "mute" message handling.
+    // AUDIO_OUTPUT=robot/usb mode, playing on hardware the browser can't
+    // touch at all), so the server also needs telling to stop forwarding/
+    // playing it — see app/main.py's "mute" message handling.
     stopPlayback();
     const ws = wsRef.current;
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "mute" }));
     }
-    setStatus(micActive ? "listening" : "idle");
-  }, [stopPlayback, micActive]);
+    setStatus(listeningLabel());
+  }, [stopPlayback, listeningLabel]);
 
   const sendText = useCallback((text: string) => {
     const trimmed = text.trim();
@@ -355,11 +374,18 @@ export function useVoiceSession() {
 
   return {
     status,
-    micActive,
-    micSource,
-    setMicSource,
+    wsConnected,
+    browserMicActive,
     robotMicAvailable,
     usbMicAvailable,
+    hwMicAwake,
+    wakeHwMicNow,
+    putHwMicToSleep,
+    preferredMicInput,
+    setMicInput,
+    speakerTargets,
+    activeSpeakerTarget,
+    setAudioOutput,
     transcript,
     toolLog,
     startMic,

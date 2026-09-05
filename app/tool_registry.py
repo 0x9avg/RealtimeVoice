@@ -1,7 +1,5 @@
 """Single place that decides which tools a session gets, based on
-settings.robot_profile. Used by both app/main.py (browser WS sessions) and
-app/robot_main.py (headless on-robot runner) — previously each defined its
-own near-identical build_tool_registry(); this is the de-duplication point.
+settings.robot_profile. Used by app/main.py's SessionHub.
 """
 
 from __future__ import annotations

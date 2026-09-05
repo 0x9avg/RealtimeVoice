@@ -1,22 +1,16 @@
 import { useState } from "react";
 import { VideoOff } from "lucide-react";
 
-import { getAuthToken } from "../api/client";
-
 // NEW — not a port of humanoid-robot's CameraView (that one talks to a
 // completely different backend shape). Same browser-native idea though:
 // a plain <img> pointed at an MJPEG multipart stream
 // (app/api_routes.py's GET /api/camera/stream, backed by app/camera_hub.py)
 // is the standard way to show a live feed without a video-streaming library.
-//
-// <img> can't set an Authorization header, so the token (if any) goes in
-// the query string — see app/auth.py's require_token for the matching
-// server-side fallback.
+// Open API (item 4 of the 2026-09-04 fixes list) — no token to attach.
 export function CameraView() {
   const [failed, setFailed] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
-  const token = getAuthToken();
-  const src = `/api/camera/stream${token ? `?token=${encodeURIComponent(token)}` : ""}`;
+  const src = "/api/camera/stream";
 
   if (failed) {
     return (

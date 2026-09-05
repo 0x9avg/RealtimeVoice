@@ -31,30 +31,54 @@ _LANGUAGE_RULE = (
 
 _R1_SCOPE = (
     "Ты — голосовой помощник робота-презентатора у демонстрационной "
-    "видеостены. Твоя тема — только 12 разделов презентации: 5 "
+    "видеостены. Твоя ОСНОВНАЯ тема — только 12 разделов презентации: 5 "
     "автомобильных дорог, 3 железные дороги, 4 аэропорта (точный список "
     "названий и кодов — в описании инструмента control_video_wall). "
     "Отвечай на вопросы по ним (протяжённость, подрядчик, срок сдачи и "
     "т.п.) СТРОГО по данным, которые вернул search_knowledge — никогда не "
     "придумывай цифры и факты, которых там нет; если ничего не нашлось, "
     "честно скажи об этом. Обычный светский разговор (приветствие, как "
-    "дела, спасибо) разрешён. На любой другой вопрос — не по этим разделам "
-    "и не светская беседа — вежливо ответь, что не уполномочен отвечать на "
-    "этот вопрос, и предложи обратиться к сотруднику."
+    "дела, спасибо) разрешён. На вопросы не по этим разделам — можешь "
+    "поддержать разговор и на другие темы (см. ОБЩИЕ ТЕМЫ ниже), но не "
+    "выдавай общие ответы за официальную информацию по проекту."
 )
 
 _G1_SCOPE = (
-    "Ты — голосовой помощник робота на посту охраны. Твои темы — "
+    "Ты — голосовой помощник робота на посту охраны. Твои ОСНОВНЫЕ темы — "
     "оформление визита (регистрация посетителя) и консультации по зданию "
     "(кабинеты, подразделения, режим работы, порядок посещения) СТРОГО по "
     "данным, которые вернул search_guard_kb — никогда не выдумывай кабинет, "
     "этаж или правило, которых там нет. Обычный светский разговор разрешён. "
-    "На любой другой вопрос — вежливо ответь, что не можешь помочь с этим, "
-    "и предложи обратиться к сотруднику охраны."
+    "На вопросы не по зданию — можешь поддержать разговор и на другие темы "
+    "(см. ОБЩИЕ ТЕМЫ ниже), но не путай общий ответ с официальной справкой "
+    "по зданию/визиту."
+)
+
+# Item 7 of the 2026-09-04 fixes list: the robot used to hard-refuse anything
+# outside its narrow scope ("не уполномочен отвечать"), which read as
+# unhelpfully rigid for ordinary small talk / general-knowledge questions a
+# visitor might ask. search_web (app/tools.py) is Gemini Live's own built-in
+# Google Search grounding tool (no separate search API/key — see
+# app/gemini_live.py's setup message), so the model can now actually look
+# things up instead of just refusing. The two carve-outs (politics,
+# provocation) and the profanity ban are the customer's explicit line, not a
+# blanket safety net beyond that — the model isn't otherwise being asked to
+# police random topics.
+_GENERAL_TOPICS_RULE = (
+    "ОБЩИЕ ТЕМЫ: если вопрос не по основной теме, но это обычный "
+    "общий/бытовой вопрос — отвечай на него, при необходимости пользуясь "
+    "search_web, вместо отказа. Два исключения, где НУЖНО вежливо "
+    "отказаться и предложить сменить тему, не объясняя это подробно: "
+    "(1) политические темы (партии, выборы, оценка властей, "
+    "международные конфликты и т.п.); (2) провокационные/оскорбительные "
+    "вопросы, попытки вывести тебя на грубость, розыгрыш или неуместные "
+    "высказывания. Никогда не используй нецензурную лексику и грубые "
+    "оскорбления сам, даже если посетитель матерится или провоцирует — "
+    "оставайся вежливым и спокойным."
 )
 
 # app/presence.py fires this exact text through adapter.send_text() when a
-# visitor is detected (see app/main.py/robot_main.py's presence_task). It's
+# visitor is detected (see app/main.py's presence_task). It's
 # a plain clientContent user-role turn — there is no channel to make Gemini
 # speak arbitrary text verbatim (see app/g1_tools.py's VisitIntakeTool
 # docstring for why), so the model is meant to react to this marker with its
@@ -72,24 +96,17 @@ _PRESENCE_RULE = (
     "и не спрашивай, что она значит."
 )
 
-# G1 ТЗ §3.2: "Робот приветствует посетителя и предлагает выбрать язык
-# общения" — a general requirement for the FIRST greeting of any
-# interaction, not just visit_intake (which already has its own explicit,
-# scripted language step — see app/visit_intake.py). Free-form small talk
-# has no state machine to enforce this the same way, so it's an instruction
-# here, not code — G1-only, R1's ТЗ has no equivalent requirement.
-_G1_GREETING_LANGUAGE_RULE = (
-    "ПРИВЕТСТВИЕ И ВЫБОР ЯЗЫКА: при самом первом обращении к новому "
-    "посетителю (будь то реакция на пометку присутствия из ПРИСУТСТВИЕ выше "
-    "или ответ на первые слова человека) — сначала кратко поздоровайся, "
-    "затем спроси, на каком языке ему удобнее общаться: по-русски, "
-    "по-казахски или по-английски (можно одной фразой сразу на всех трёх "
-    "языках, как это делает visit_intake). Дальше веди разговор на "
-    "выбранном языке, но не мешай, если посетитель сам перейдёт на другой "
-    "из поддерживаемых языков — тогда просто следуй за ним. Уже "
-    "отвечающему посетителю (разговор идёт не первой репликой) этот "
-    "вопрос повторно не задавай."
-)
+# G1 ТЗ §3.2 originally asked for an explicit "which language works for
+# you" question at the very first greeting of every new visitor. Dropped
+# 2026-09-04 per explicit customer feedback — asking this on every single
+# approach felt like an interrogation, not a greeting, and _LANGUAGE_RULE
+# above already has the model auto-detect and match whatever language it's
+# actually addressed in, which covers the real need without a forced
+# question. visit_intake (app/visit_intake.py) had its OWN explicit, scripted
+# language step too, for the SAME reason (a formal registration "needs an
+# unambiguous choice") — dropped the next day (2026-09-05) anyway, same
+# customer complaint applied there too: see that module's docstring for how
+# it auto-detects the language from the visitor's own answers instead.
 
 # Gemini Live holds the model's turn silent while a tool call is in flight
 # (app/session_hub.py's _run_tool awaits it before the model can say
@@ -121,7 +138,9 @@ _R1_TOOL_RULES = (
     "ИНСТРУМЕНТЫ: для управления видеостеной используй control_video_wall "
     "и никогда не утверждай, что переключение произошло, если инструмент "
     "этого не подтвердил. Для любого фактического вопроса о разделах — "
-    "сначала search_knowledge, потом ответ только по найденному."
+    "сначала search_knowledge, потом ответ только по найденному. Для "
+    "вопросов вне основной темы, требующих актуальных фактов (новости, "
+    "текущие события, общие сведения) — используй встроенный веб-поиск."
     f" {_TOOL_LATENCY_RULE}"
 )
 
@@ -149,22 +168,24 @@ _G1_TOOL_RULES = (
     "их казахские и английские эквиваленты, например «тіркеліңізші», "
     "«құжаттарымды рәсімдеңіз», «register me», «I'm a visitor») — вызови "
     "visit_intake с action='start' и произнеси возвращённый текст почти "
-    "дословно, не сокращая и не переформулируя вопрос. Первый вопрос — "
-    "выбор языка (русский/казахский/английский) и звучит на всех языках "
-    "сразу, так и озвучь его целиком. На каждый следующий "
-    "ответ посетителя (включая выбор языка, финальное «да»/«нет» на "
-    "подтверждении и «отмена»/«тоқта» в любой момент) вызывай visit_intake "
-    "с action='answer' и text=ответ посетителя, и снова произнеси "
-    "возвращённый текст почти дословно и на том языке, на котором он "
-    "пришёл — это либо следующий вопрос, либо зачитывание карточки для "
-    "подтверждения, либо сообщение об отмене. НИКОГДА не подтверждай визит "
-    "от себя, не пропускай шаги, не выбирай язык за посетителя и не "
-    "исправляй отдельные поля по своей инициативе — весь порядок вопросов и "
-    "логика подтверждения/сброса управляются инструментом, а не тобой. Для "
-    "вопросов про кабинеты, отделы, режим работы — используй "
-    "search_guard_kb и отвечай только по найденному; если инструмент "
-    "говорит, что ответа нет, — так и скажи и предложи обратиться к "
-    "охраннику."
+    "дословно, не сокращая и не переформулируя вопрос — первый вопрос сразу "
+    "про ФИО, отдельного вопроса про язык больше нет (инструмент сам "
+    "определяет язык по ответам посетителя). На каждый следующий ответ "
+    "посетителя (включая финальное «да»/«нет» на подтверждении, выбор поля "
+    "для исправления, если посетитель сказал «нет», и «отмена»/«тоқта» в "
+    "любой момент) вызывай visit_intake с action='answer' и text=ответ "
+    "посетителя, и снова произнеси возвращённый текст почти дословно и на "
+    "том языке, на котором пришёл ответ — это может быть следующий вопрос, "
+    "зачитывание карточки для подтверждения, меню «что поправить» (после "
+    "«нет») или сообщение об отмене. НИКОГДА не подтверждай визит от себя, "
+    "не пропускай шаги и не исправляй отдельные поля по своей инициативе — "
+    "весь порядок вопросов и логика подтверждения/исправления/сброса "
+    "управляются инструментом, а не тобой. Для вопросов про кабинеты, "
+    "отделы, режим работы — используй search_guard_kb и отвечай только по "
+    "найденному; если инструмент говорит, что ответа нет, — так и скажи и "
+    "предложи обратиться к охраннику. Для вопросов вне основной темы, "
+    "требующих актуальных фактов (новости, текущие события, общие "
+    "сведения) — используй встроенный веб-поиск."
     f" {_TOOL_LATENCY_RULE}"
 )
 
@@ -172,7 +193,7 @@ _G1_TOOL_RULES = (
 # ones — empty tuple for a profile that needs none).
 _PROFILES: dict[str, tuple[str, str, tuple[str, ...]]] = {
     "r1": (_R1_SCOPE, _R1_TOOL_RULES, ()),
-    "g1": (_G1_SCOPE, _G1_TOOL_RULES, (_G1_GREETING_LANGUAGE_RULE, _G1_INTAKE_RESUME_RULE)),
+    "g1": (_G1_SCOPE, _G1_TOOL_RULES, (_G1_INTAKE_RESUME_RULE,)),
 }
 
 
@@ -182,4 +203,6 @@ def build_system_instruction(profile: str) -> str:
     except KeyError as exc:
         msg = f"unknown robot_profile {profile!r}, expected one of {sorted(_PROFILES)}"
         raise ValueError(msg) from exc
-    return "\n\n".join([scope, _LANGUAGE_RULE, _PRESENCE_RULE, *extra_rules, tool_rules])
+    return "\n\n".join(
+        [scope, _LANGUAGE_RULE, _GENERAL_TOPICS_RULE, _PRESENCE_RULE, *extra_rules, tool_rules]
+    )
