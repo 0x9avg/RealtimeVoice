@@ -143,3 +143,93 @@ def test_finish_refuses_to_start_the_service_without_an_api_key(client: TestClie
     client.post("/api/profile", json={"profile": "r1"})
     res = client.post("/api/finish")
     assert res.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# setup_complete -- decides whether the panel opens as the first-run wizard
+# or as the settings menu (app/installer/static/index.html's `view`).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fake_systemd(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    """Stubs the systemd layer and records what the server asked it to do."""
+    calls: dict[str, object] = {"installed": set(), "disabled": [], "active": True}
+
+    async def is_installed(unit: str) -> bool:
+        return unit in calls["installed"]  # type: ignore[operator]
+
+    async def status(unit: str) -> dict[str, object]:
+        return {"active": "active", "is_active": calls["active"], "is_enabled": True, "detail": ""}
+
+    async def disable_now(unit: str) -> tuple[bool, str]:
+        calls["disabled"].append(unit)  # type: ignore[union-attr]
+        return True, ""
+
+    monkeypatch.setattr(server.systemd, "is_installed", is_installed)
+    monkeypatch.setattr(server.systemd, "status", status)
+    monkeypatch.setattr(server.systemd, "disable_now", disable_now)
+    return calls
+
+
+def test_setup_is_incomplete_until_profile_key_and_unit_all_exist(
+    client: TestClient, fake_systemd: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert client.get("/api/state").json()["setup_complete"] is False
+
+    client.post("/api/profile", json={"profile": "g1"})
+    assert client.get("/api/state").json()["setup_complete"] is False
+
+    monkeypatch.setattr(gemini_check, "check_api_key", _ok_key_check)
+    client.post("/api/api-key", json={"api_key": "k"})
+    # Key and profile are set, but no service unit has been installed yet:
+    # the customer still has the "Запустить робота" step ahead of them.
+    assert client.get("/api/state").json()["setup_complete"] is False
+
+    fake_systemd["installed"] = {"realtimevoice-g1.service"}  # type: ignore[index]
+    assert client.get("/api/state").json()["setup_complete"] is True
+
+
+def test_a_configured_robot_stays_setup_complete_while_its_service_is_stopped(
+    client: TestClient, fake_systemd: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stopped service must not throw the owner back into the wizard --
+    that is exactly when they need the panel's restart/log controls."""
+    monkeypatch.setattr(gemini_check, "check_api_key", _ok_key_check)
+    client.post("/api/profile", json={"profile": "r1"})
+    client.post("/api/api-key", json={"api_key": "k"})
+    fake_systemd["installed"] = {"realtimevoice-r1.service"}  # type: ignore[index]
+    fake_systemd["active"] = False  # type: ignore[index]
+
+    body = client.get("/api/state").json()
+    assert body["service_status"]["is_active"] is False
+    assert body["setup_complete"] is True
+
+
+def test_switching_profile_stops_the_previous_profiles_service(
+    client: TestClient, fake_systemd: dict[str, object]
+) -> None:
+    client.post("/api/profile", json={"profile": "r1"})
+    fake_systemd["installed"] = {"realtimevoice-r1.service"}  # type: ignore[index]
+
+    res = client.post("/api/profile", json={"profile": "g1"})
+
+    assert res.json()["stopped_previous"] == "realtimevoice-r1.service"
+    assert fake_systemd["disabled"] == ["realtimevoice-r1.service"]
+    assert client.get("/api/state").json()["profile"] == "g1"
+
+
+def test_reselecting_the_same_profile_leaves_the_running_service_alone(
+    client: TestClient, fake_systemd: dict[str, object]
+) -> None:
+    client.post("/api/profile", json={"profile": "r1"})
+    fake_systemd["installed"] = {"realtimevoice-r1.service"}  # type: ignore[index]
+
+    res = client.post("/api/profile", json={"profile": "r1"})
+
+    assert res.json()["stopped_previous"] is None
+    assert fake_systemd["disabled"] == []
+
+
+async def _ok_key_check(api_key: str) -> gemini_check.KeyCheckResult:
+    return gemini_check.KeyCheckResult(True, "ок")

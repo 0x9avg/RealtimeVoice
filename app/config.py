@@ -251,11 +251,19 @@ class Settings(BaseModel):
     # below is set, an external USB mic (UsbMic) get constructed together
     # (see app/session_hub.py's __init__ — same pattern AUDIO_OUTPUT already
     # uses for _speakers), so an operator can switch between them LIVE, from
-    # the website, with no restart and no `.env` edit (2026-09-06 ask,
-    # explicit: "микрофон... выбирается не посредством .env файла, а
-    # напрямую на сайте"). This field only picks the STARTING preference for
-    # a fresh process — see SessionHub.set_preferred_mic_input for the
-    # actual live switch.
+    # the website, with no restart (2026-09-06 ask, explicit: "микрофон...
+    # выбирается не посредством .env файла, а напрямую на сайте" — the
+    # CHOICE is made on the website, never by hand-editing this file).
+    # That live switch writes its result back here (SessionHub's
+    # _remember_audio_choice, 2026-09-07) so it survives a restart: this
+    # field is both the starting preference for a fresh process AND the
+    # record of what the operator last selected — see
+    # SessionHub.set_preferred_mic_input.
+    #
+    # What this field does NOT decide at runtime is whether hardware audio
+    # exists at all: "browser" versus "robot"/"usb" is read exactly once, in
+    # SessionHub.__init__, so turning the robot's own mic and speaker on or
+    # off is a restart-level change and stays with the setup panel.
     #
     # Exactly ONE of the constructed mics is ever allowed to run wake-word
     # detection at a time — 2026-09-06 ask, explicit: "не должно быть
@@ -291,6 +299,16 @@ class Settings(BaseModel):
     # default per that same fixes-list item ("сделаем вывод звука громче,
     # желательно на максимум").
     usb_speaker_volume_pct: int = int(os.environ.get("USB_SPEAKER_VOLUME", "100"))
+    # How much audio RobotSpeaker pushes ahead of real time when it starts
+    # an utterance — the buffer that absorbs a slow PlayStream RPC without
+    # the robot audibly hitching between words. Measured on both real
+    # robots (2026-09-07): the RPC costs ~3 ms at the median but 60-85 ms
+    # at p99, so 200 ms of lead covers roughly six consecutive worst-case
+    # spikes. Raise it if stutter is still audible on longer answers; the
+    # cost is a potentially longer tail of already-buffered speech after a
+    # barge-in or «Замолчи», since that only stops what has not been handed
+    # to the vendor yet.
+    robot_speaker_lead_ms: int = int(os.environ.get("ROBOT_SPEAKER_LEAD_MS", "200"))
     # 2026-09-06 audit finding: a real Jabra Speak2 40 MS mis-times playback
     # declared at Gemini's native 24000 Hz — a precisely-generated 10-second
     # tone finished in ~7.66s (audibly faster and higher-pitched: "голос

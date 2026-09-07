@@ -20,11 +20,13 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
-def _run(script: str) -> subprocess.CompletedProcess[str]:
+def _run(script: str, env_extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env.update(env_extra or {})
     return subprocess.run(
         [sys.executable, "-c", script],
         cwd=_REPO_ROOT,
-        env=os.environ.copy(),
+        env=env,
         capture_output=True,
         text=True,
         timeout=30,
@@ -69,6 +71,10 @@ def test_ws_session_needs_no_token() -> None:
 
 
 def test_rest_api_needs_no_token() -> None:
-    result = _run(_REST_SCRIPT)
+    # /api/visits is the sample data endpoint here, and it exists only on
+    # the G1 profile now (app/api_routes.py's `only_on`) -- so pin the
+    # profile rather than let the default make this look like an auth
+    # failure when it is really a route that belongs to the other robot.
+    result = _run(_REST_SCRIPT, {"ROBOT_PROFILE": "g1"})
     assert result.returncode == 0, result.stderr
     assert "OK" in result.stdout

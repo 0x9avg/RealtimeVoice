@@ -35,6 +35,7 @@ from fastapi import WebSocket
 
 from app.camera_hub import camera_hub, sampled
 from app.config import Settings
+from app import env_file
 from app.g1_tools import log_relay_divergence
 from app.knowledge import knowledge_base
 from app.gemini_live import (
@@ -104,6 +105,7 @@ class SessionHub:
             self._speakers["robot"] = RobotSpeaker(
                 network_interface=settings.robot_speaker_network_interface,
                 volume_pct=settings.robot_speaker_volume_pct,
+                lead_s=settings.robot_speaker_lead_ms / 1000.0,
             )
             if settings.usb_speaker_alsa_device:
                 self._speakers["usb"] = UsbSpeaker(
@@ -126,9 +128,10 @@ class SessionHub:
         # default) whenever this deployment is in hardware-input mode at
         # all, exactly mirroring `_speakers` above — so an operator can
         # switch which one is listened to at runtime, from the website, with
-        # no restart and no `.env` edit (2026-09-06 ask, explicit: "и
-        # микрофон с динамиком выбирается не посредством .env файла, а
-        # напрямую на сайте"). See `_preferred_mic_input`/
+        # no restart (2026-09-06 ask, explicit: "и микрофон с динамиком
+        # выбирается не посредством .env файла, а напрямую на сайте" — the
+        # choice is made on the site; `_remember_audio_choice` then records
+        # it so a restart doesn't undo it). See `_preferred_mic_input`/
         # `set_preferred_mic_input` below for the actual selection —
         # constructing both here is cheap and side-effect-free (RobotMic/
         # UsbMic only touch the network/spawn `arecord` lazily, inside their
@@ -530,6 +533,7 @@ class SessionHub:
         if self.gate is not None:
             self.gate.on_speaking_stopped()
         _LOG.info("session_hub.audio_output -> %s", target)
+        await self._remember_audio_choice("AUDIO_OUTPUT", target)
         await self._broadcast_json(self._capabilities_message())
 
     async def set_preferred_mic_input(self, source: str) -> None:
@@ -539,7 +543,10 @@ class SessionHub:
         `handle_audio_output` above: both hardware mics are always
         constructed together (see `self.mic`/`self.usb_mic` in `__init__`),
         so switching here is instant — no restart, no cold `arecord`/socket
-        start, no `.env` edit. Only switches to a source that's actually
+        start. The choice is then recorded in `.env` by
+        `_remember_audio_choice` so it survives one (the operator never
+        edits that file themselves — that was the point of the original
+        ask). Only switches to a source that's actually
         configured here (see `_wake_detectors`); a request for one that
         doesn't exist, or the one already preferred, is a no-op — same
         convention as handle_mic_source/handle_audio_output.
@@ -556,7 +563,40 @@ class SessionHub:
             robot_mic_state.active_source = "browser"
             self._wake_active_until = 0.0
         _LOG.info("session_hub.preferred_mic_input -> %s", source)
+        await self._remember_audio_choice("AUDIO_INPUT", source)
         await self._broadcast_json(self._capabilities_message())
+
+    async def _remember_audio_choice(self, key: str, value: str) -> None:
+        """Write an operator's live audio choice back to `.env` so it
+        survives a restart.
+
+        Without this the two control surfaces disagree the moment the
+        service is restarted: the robot's own page (:8000) switches the
+        ACTIVE source, but `AUDIO_INPUT`/`AUDIO_OUTPUT` are read exactly
+        once, in `__init__`, so the next start silently reverted to
+        whatever the setup panel had written — an operator who moved the
+        mic to the USB headset before a demo found it back on the built-in
+        mic after any restart, with nothing on either page explaining why.
+
+        Only ever narrows within hardware: both callers refuse a target
+        that wasn't constructed at startup, and hardware targets only exist
+        when the stored value was already "robot"/"usb" — so this can never
+        turn hardware audio on or off behind the operator's back, only
+        record which of the existing devices they picked.
+
+        Failure here must not break the switch the operator just made (a
+        read-only checkout, a `.env` removed by hand): the live change has
+        already taken effect, so this logs and moves on rather than raising
+        into the websocket handler.
+        """
+        # Module attributes, not `from ... import ENV_PATH` -- the path is
+        # resolved per call so tests can redirect it away from the
+        # developer's own `.env` (see tests/test_session_hub.py's autouse
+        # fixture); a from-import would bind the real path at import time.
+        try:
+            await asyncio.to_thread(env_file.set_values, env_file.ENV_PATH, {key: value})
+        except OSError as exc:
+            _LOG.warning("session_hub.audio_choice_not_persisted %s=%s: %s", key, value, exc)
 
     async def handle_mute(self) -> None:
         self.muted = True

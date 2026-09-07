@@ -1,5 +1,12 @@
 """Comment-preserving `.env` reader/writer.
 
+Lives at the top level, not under `app/installer/`, because there are two
+writers: the setup wizard (`app/installer/server.py`), and the running
+service itself when an operator changes an audio device on the robot's own
+page — a choice that has to survive a restart, so it lands in `.env` rather
+than only in process memory (see `app/session_hub.py`'s
+`set_preferred_mic_input`/`handle_audio_output`).
+
 `app/config.py`'s `.env.r1.example`/`.env.g1.example` carry extensive
 explanatory comments next to every setting — the wizard must be able to set
 `GEMINI_API_KEY=...` or `WAKE_WORD_PHRASES=...` in the customer's real
@@ -15,6 +22,12 @@ from __future__ import annotations
 from pathlib import Path
 
 _KEY_LINE = "^([A-Za-z_][A-Za-z0-9_]*)="
+
+# The one `.env` this deployment runs on — same file `app/config.py` loads
+# at import time (project root, next to `pyproject.toml`). Defined here so
+# the running service and the setup wizard can never disagree about which
+# file they are editing.
+ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 
 
 def read_values(path: Path) -> dict[str, str]:

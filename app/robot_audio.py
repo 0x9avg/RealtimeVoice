@@ -32,6 +32,7 @@ import asyncio
 import contextlib
 import importlib
 import logging
+import math
 import re
 import socket
 import struct
@@ -286,6 +287,14 @@ _CHUNK_BYTES = _G1_SAMPLE_RATE * _SAMPLE_WIDTH_BYTES * _CHUNK_MS // 1000  # 1600
 # threshold in `_pace_wait_for_next_slot` below.
 _LEAD_S = 0.2
 
+# How far the send schedule must fall behind wall-clock before it is treated
+# as a genuine stall (the vendor buffer has actually drained) rather than
+# ordinary jitter to be caught up. Measured on the real robots 2026-09-07:
+# a single `PlayStream` RPC costs ~3 ms at the median but 60-85 ms at p99
+# (~2.5% of calls), i.e. longer than the 50 ms slot it occupies — so being
+# tens of milliseconds late is NORMAL and must not be mistaken for a stall.
+_STALL_RESET_S = 0.5
+
 
 def _require_sdk() -> Any:
     try:
@@ -306,6 +315,12 @@ class RobotSpeaker:
     network_interface: str
     volume_pct: int = 100
     app_name: str = "realtimevoice"
+    # How much audio to push ahead of real time at the start of an
+    # utterance — the cushion that absorbs slow PlayStream RPCs. Bigger =
+    # more margin against stutter, at the cost of a longer tail if the
+    # vendor keeps playing what it has already buffered after a PlayStop
+    # (barge-in / «Замолчи»). See ROBOT_SPEAKER_LEAD_MS in app/config.py.
+    lead_s: float = _LEAD_S
     _client: Any = field(default=None, init=False, repr=False)
     _stream_id: str = field(default="", init=False)
     _next_send_monotonic: float = field(default=0.0, init=False)
@@ -317,6 +332,29 @@ class RobotSpeaker:
     # True only until the first play() call of a fresh utterance has primed
     # the buffer — see play()'s use of this and _LEAD_S's docstring.
     _is_first_chunk_of_utterance: bool = field(default=True, init=False)
+    # Per-utterance pacing stats, reported once per turn by stop(). Without
+    # these, "робот запинается между словами" is unfalsifiable from a log:
+    # the audible symptom is the vendor's buffer running dry, which happens
+    # HERE, silently, a few chunks before anything sounds wrong.
+    #
+    # The tracked quantity is how much audio the vendor still had left to
+    # play at the worst moment: (what we have handed it) minus (how long it
+    # has been playing). Not "how late was this chunk versus its slot" --
+    # during the opening priming burst every chunk is deliberately "late"
+    # by up to a full lead, while the buffer is in fact FILLING.
+    _utterance_start_monotonic: float = field(default=0.0, init=False)
+    _chunks_sent: int = field(default=0, init=False)
+    _min_buffered_s: float = field(default=0.0, init=False)
+    # Set once the opening burst is over — i.e. the first time the pacer
+    # actually has to WAIT for a slot, which by definition means it has
+    # handed the vendor everything the lead intends it to hold. Before that
+    # a low reading is the normal cold start, not a symptom.
+    #
+    # Deliberately NOT "buffered >= lead": `asyncio.sleep` never wakes
+    # early, so the measured level after a slot is always a hair under the
+    # lead and that comparison never becomes true on real hardware (found
+    # on the robots 2026-09-07 — the statistic silently never printed).
+    _buffer_primed: bool = field(default=False, init=False)
 
     def _ensure_client(self) -> Any:
         if self._client is not None:
@@ -359,7 +397,14 @@ class RobotSpeaker:
             # takes. That reads as "the browser session hung then closed"
             # with no server-side error, since nothing raised — it just never
             # got to run anything else while blocked.
-            client = await asyncio.to_thread(self._ensure_client)
+            # Only pay for a thread hop when the client actually has to be
+            # built: `_ensure_client` is a no-op on every call after the
+            # first, but `asyncio.to_thread` still costs a round trip
+            # through the executor on each AudioChunk, right on the pacing
+            # path.
+            client = self._client
+            if client is None:
+                client = await asyncio.to_thread(self._ensure_client)
             epoch = self._epoch
             now = time.monotonic()
             if self._is_first_chunk_of_utterance:
@@ -374,12 +419,31 @@ class RobotSpeaker:
                 # this same `<= now` check on EVERY call and re-trigger the
                 # ~200ms priming burst mid-sentence — audible as a stutter,
                 # not just a one-time buffer prime.
-                self._next_send_monotonic = now - _LEAD_S
+                self._next_send_monotonic = now - self.lead_s
                 self._is_first_chunk_of_utterance = False
-            elif self._next_send_monotonic < now:
-                # Fell behind (processing lag) — resume from now, but don't
-                # re-arm the priming burst for it.
-                self._next_send_monotonic = now
+                self._reset_pacing_stats(now)
+            elif self._next_send_monotonic < now - _STALL_RESET_S:
+                # A genuine stall (nothing to play for half a second+): the
+                # vendor buffer really has drained, so re-prime it the same
+                # way a fresh utterance does. Without the lead here, the
+                # first chunks after the gap would arrive exactly as they
+                # are needed, with zero margin.
+                self._next_send_monotonic = now - self.lead_s
+                self._reset_pacing_stats(now)
+            # No `elif ... < now` reset. 2026-09-07 fix for "робот делает
+            # запинки между словами": the schedule is ABSOLUTE (each chunk
+            # is due 50 ms after the previous one, wherever the clock
+            # actually is), which is what lets a slow PlayStream RPC be
+            # caught up by sending the next chunks back-to-back — the
+            # cushion dips for a moment and refills itself. Snapping the
+            # schedule to `now` whenever it was even 1 ms behind, as this
+            # branch used to, threw that cushion away permanently: every
+            # AudioChunk that happened to arrive just after an 85 ms RPC
+            # spike re-anchored playback to real time with ZERO margin, and
+            # from then on each further spike in that turn was an audible
+            # gap between words. (The upstream adapter this was ported from
+            # has the opposite bug — it re-primes the full lead on every
+            # call, which bursts ~200 ms of audio mid-sentence.)
             for offset in range(0, len(converted), _CHUNK_BYTES):
                 # A stop() landed while this call was pacing (barge-in, or
                 # the operator's "Замолчи"). Bail at the chunk boundary
@@ -429,6 +493,19 @@ class RobotSpeaker:
         # it and only releases between paced chunks, so waiting for the lock
         # first would mean waiting out the audio we're trying to cut off.
         self._epoch += 1
+        if self._buffer_primed and math.isfinite(self._min_buffered_s):
+            # How much audio the vendor still had queued at the worst moment
+            # of this utterance. At or below zero it ran dry — that is the
+            # stutter, heard as a hitch between words.
+            worst_ms = self._min_buffered_s * 1000
+            log = _LOG.warning if worst_ms <= 0 else _LOG.info
+            log(
+                "robot_speaker.turn_pacing chunks=%d lead_ms=%.0f worst_buffer_ms=%.0f",
+                self._chunks_sent,
+                self.lead_s * 1000,
+                worst_ms,
+            )
+            self._buffer_primed = False
         async with self._lock:
             self._resample_state = None
             self._resample_src_rate = 0
@@ -445,15 +522,39 @@ class RobotSpeaker:
             self._stream_id = str(int(time.time() * 1000))
             self._next_send_monotonic = time.monotonic()
 
+    def _reset_pacing_stats(self, now: float) -> None:
+        self._utterance_start_monotonic = now
+        self._chunks_sent = 0
+        self._min_buffered_s = math.inf
+        self._buffer_primed = False
+
+    def _record_buffer_level(self, now: float) -> None:
+        if not self._buffer_primed:
+            return  # still filling: the opening burst, not a shortfall
+        buffered = self._chunks_sent * (_CHUNK_MS / 1000.0) - (
+            now - self._utterance_start_monotonic
+        )
+        self._min_buffered_s = min(self._min_buffered_s, buffered)
+
     async def _pace_wait_for_next_slot(self) -> None:
         now = time.monotonic()
-        if self._next_send_monotonic < now - 0.5:
-            # Fell far behind (long silence) — don't burst-play the backlog.
-            self._next_send_monotonic = now
-        else:
-            wait = self._next_send_monotonic - now
-            if wait > 0:
-                await asyncio.sleep(wait)
+        slack = self._next_send_monotonic - now
+        if slack < -_STALL_RESET_S:
+            # Fell far behind (long silence) — don't burst-play the whole
+            # backlog, but do restore the lead: after a gap this long the
+            # vendor has nothing left buffered, so resuming exactly at
+            # real time would leave no margin at all.
+            self._next_send_monotonic = now - self.lead_s
+            self._reset_pacing_stats(now)
+        elif slack > 0:
+            await asyncio.sleep(slack)
+            self._buffer_primed = True
+        # Re-read the clock rather than assuming the sleep landed exactly on
+        # the slot: the point of this measurement is to catch real delivery
+        # jitter, and trusting the schedule here would report the buffer
+        # level we INTENDED, which is never the one that stutters.
+        self._record_buffer_level(time.monotonic())
+        self._chunks_sent += 1
         self._next_send_monotonic += _CHUNK_MS / 1000.0
 
 

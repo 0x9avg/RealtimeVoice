@@ -16,10 +16,23 @@ import time
 
 import pytest
 
+from pathlib import Path
+
+from app import env_file
 from app.config import Settings
 from app.gemini_live import AudioChunk, Interrupted, Transcript, TurnComplete
+from app.env_file import read_values
 from app.robot_mic_state import robot_mic_state
 from app.session_hub import SessionHub
+
+
+@pytest.fixture(autouse=True)
+def _isolate_env_file(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    # The hub now writes an operator's live audio choice back to `.env`
+    # (see _remember_audio_choice) -- without this redirect, running the
+    # suite would rewrite the developer's OWN `.env` at the project root.
+    monkeypatch.setattr(env_file, "ENV_PATH", tmp_path / ".env")
+    return tmp_path / ".env"
 
 
 @pytest.fixture(autouse=True)
@@ -99,9 +112,13 @@ def test_audio_input_only_picks_the_initial_preferred_mic() -> None:
     assert hub2._preferred_mic_input == "usb"
 
 
-async def test_set_preferred_mic_input_switches_live_without_touching_env(
-    caplog: pytest.LogCaptureFixture,
+async def test_set_preferred_mic_input_switches_live_and_is_remembered(
+    _isolate_env_file: Path,
 ) -> None:
+    """Switching is instant (both mics stay constructed, nothing re-inits),
+    AND the choice is written back to `.env` so a restart doesn't silently
+    revert to whatever the setup panel last wrote -- see
+    _remember_audio_choice."""
     hub = SessionHub(Settings(audio_input="robot", usb_mic_alsa_device="hw:MS,0"))
     assert hub._preferred_mic_input == "robot"
 
@@ -111,6 +128,46 @@ async def test_set_preferred_mic_input_switches_live_without_touching_env(
     # Still both constructed -- switching again must be instant, no re-init.
     assert hub.mic is not None
     assert hub.usb_mic is not None
+    assert read_values(_isolate_env_file)["AUDIO_INPUT"] == "usb"
+
+
+async def test_audio_output_switch_is_remembered(_isolate_env_file: Path) -> None:
+    hub = make_hub()
+    hub._speakers = {"robot": FakeOutputSpeaker(), "usb": FakeOutputSpeaker()}
+    hub._active_speaker_target = "robot"
+
+    await hub.handle_audio_output("usb")
+
+    assert read_values(_isolate_env_file)["AUDIO_OUTPUT"] == "usb"
+
+
+async def test_a_no_op_switch_writes_nothing(_isolate_env_file: Path) -> None:
+    """A request for an unconfigured source is already a no-op for the live
+    state; it must not leave a stray line in `.env` claiming otherwise."""
+    hub = SessionHub(Settings(audio_input="robot", usb_mic_alsa_device=""))
+
+    await hub.set_preferred_mic_input("usb")  # not configured
+
+    assert not _isolate_env_file.exists()
+
+
+async def test_a_failed_env_write_does_not_break_the_live_switch(
+    _isolate_env_file: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A read-only checkout must not turn "switch my microphone" into an
+    error in the websocket handler -- the switch has already happened."""
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(env_file, "set_values", boom)
+    hub = SessionHub(Settings(audio_input="robot", usb_mic_alsa_device="hw:MS,0"))
+
+    with caplog.at_level(logging.WARNING):
+        await hub.set_preferred_mic_input("usb")
+
+    assert hub._preferred_mic_input == "usb"
+    assert any("audio_choice_not_persisted" in r.getMessage() for r in caplog.records)
 
 
 async def test_set_preferred_mic_input_ignores_a_source_that_is_not_configured() -> None:

@@ -1,11 +1,11 @@
-"""app/installer/env_file.py — must edit `.env` without destroying the
+"""app/env_file.py — must edit `.env` without destroying the
 extensive documentation comments in .env.r1.example/.env.g1.example."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from app.installer.env_file import read_values, set_values
+from app.env_file import read_values, set_values
 
 
 def test_set_values_creates_file_from_template_when_missing(tmp_path: Path) -> None:

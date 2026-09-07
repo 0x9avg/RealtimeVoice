@@ -60,6 +60,18 @@ async def enable_now(unit_name: str) -> tuple[bool, str]:
     return code == 0, out
 
 
+async def disable_now(unit_name: str) -> tuple[bool, str]:
+    """Stop a unit and take it out of the boot sequence.
+
+    Used when the customer switches the robot profile in the settings
+    menu: both units default to the same port (8000), so leaving the
+    previous profile's service enabled would mean the old role keeps
+    running and holding the port the new one is about to bind.
+    """
+    code, out = await _run("systemctl", "--user", "disable", "--now", unit_name)
+    return code == 0, out
+
+
 async def action(unit_name: str, verb: str) -> tuple[bool, str]:
     """verb: one of start / stop / restart."""
     code, out = await _run("systemctl", "--user", verb, unit_name)

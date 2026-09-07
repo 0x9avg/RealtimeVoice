@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
 
 from app.camera_hub import camera_hub
@@ -25,15 +25,46 @@ router = APIRouter(prefix="/api")
 _MJPEG_BOUNDARY = "frame"
 
 
+def only_on(profile: str) -> Any:
+    """Make a route exist only on the robot it belongs to.
+
+    Half of this API is role-specific: a G1 at a security desk has no video
+    wall, an R1 in a demo hall keeps no visit journal. Both halves used to
+    be served by both profiles, which meant `POST /api/wall/command` on a
+    G1 spent the wall-agent timeout trying to reach a machine that was
+    never configured, and `GET /api/visits` on an R1 answered `{"records":
+    []}` — an answer indistinguishable from "there are no visitors yet",
+    for a journal that will never exist there.
+
+    404, not 403: from the operator's side the route genuinely is not part
+    of this robot, which is also what makes the frontend's routing simple
+    (see web-src/src/App.tsx — it hides the same pair of pages).
+    """
+
+    async def guard() -> None:
+        if settings.robot_profile != profile:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"этот раздел доступен только на роботе {profile.upper()}; "
+                    f"здесь запущен профиль {settings.robot_profile.upper()}"
+                ),
+            )
+
+    return Depends(guard)
+
+
 @router.get("/profile")
 async def profile() -> dict[str, str]:
-    """Lets a static page ask "which robot am I" instead of hardcoding it —
-    web/index.html uses this to show only the Видеостена (r1) or Охрана (g1)
-    nav link, never both."""
+    """Lets the frontend ask "which robot am I" instead of hardcoding it.
+    Everything role-specific hangs off this one answer: which tab the nav
+    shows, which page routes exist at all (web-src/src/App.tsx), and — on
+    the server side — which half of this API is reachable (see `only_on`).
+    Available on both profiles, obviously: it is the question itself."""
     return {"profile": settings.robot_profile}
 
 
-@router.get("/visits")
+@router.get("/visits", dependencies=[only_on("g1")])
 async def list_visits(
     status: str | None = Query(default=None, pattern="^(new|processed)$"),
     limit: int = Query(default=100, ge=1, le=1000),
@@ -42,7 +73,7 @@ async def list_visits(
     return {"records": records}
 
 
-@router.post("/visits/{visit_id}/processed")
+@router.post("/visits/{visit_id}/processed", dependencies=[only_on("g1")])
 async def mark_processed(visit_id: str) -> dict[str, Any]:
     ok = mark_visit_processed(Path(settings.visit_journal_path), visit_id)
     if not ok:
@@ -50,7 +81,7 @@ async def mark_processed(visit_id: str) -> dict[str, Any]:
     return {"id": visit_id, "status": "processed"}
 
 
-@router.post("/wall/command")
+@router.post("/wall/command", dependencies=[only_on("r1")])
 async def wall_command(command: WallCommand) -> dict[str, Any]:
     headers = {"X-Wall-Token": settings.wall_agent_token} if settings.wall_agent_token else {}
     try:
@@ -65,7 +96,7 @@ async def wall_command(command: WallCommand) -> dict[str, Any]:
     return response.json()
 
 
-@router.get("/wall/health")
+@router.get("/wall/health", dependencies=[only_on("r1")])
 async def wall_health() -> dict[str, Any]:
     """Reveals connectivity only, matching the R1 PDF's "На связи/Нет связи" chip."""
     try:

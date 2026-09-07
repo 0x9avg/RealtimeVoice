@@ -6,7 +6,7 @@ built once at import time from whatever `.env` already contains, which is
 exactly the thing this wizard is helping create/fix; if `.env` is missing
 or half-written (the normal state on a first run), `Settings()` should not
 be a precondition for the wizard itself to come up. All `.env` reads/writes
-here go through `app.installer.env_file` instead, which tolerates a
+here go through `app.env_file` instead, which tolerates a
 missing or partially-filled file.
 """
 
@@ -22,7 +22,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
-from app.installer import audio, env_file, gemini_check, logs, network, settings_schema, systemd
+from app import env_file
+from app.installer import audio, gemini_check, logs, network, settings_schema, systemd
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 _LOG = logging.getLogger("installer")
@@ -97,6 +98,18 @@ async def get_state() -> dict[str, object]:
         "service_status": service_status,
         "port": _PROFILE_META[profile]["port"] if profile else None,
         "lan_ip": network.detect_lan_ip(),
+        # Decides which of the two faces the page shows: the linear
+        # first-run wizard, or the settings menu. Deliberately does NOT
+        # require the service to be RUNNING right now -- a robot whose
+        # service is merely stopped (or crashed) is still a configured
+        # robot, and dropping its owner back into "Добро пожаловать 👋 /
+        # какой это робот?" would both insult them and hide the very
+        # controls (журнал, перезапуск) they opened the page to use.
+        "setup_complete": bool(
+            profile is not None
+            and values.get("GEMINI_API_KEY", "").strip()
+            and service_installed
+        ),
     }
 
 
@@ -111,10 +124,25 @@ class ProfileRequest(BaseModel):
 
 @app.post("/api/profile")
 async def set_profile(body: ProfileRequest) -> dict[str, object]:
+    previous = _current_profile()
     meta = _PROFILE_META[body.profile]
     template = Path(str(meta["template"]))
     env_file.set_values(_ENV_PATH, {"ROBOT_PROFILE": body.profile}, template=template)
-    return {"profile": body.profile}
+
+    # Switching profiles is a one-way step in the first-run wizard, but a
+    # normal menu item once setup is done -- and both units bind the same
+    # port (8000), so an already-installed unit for the OLD profile would
+    # keep running the old role and hold the port the new one needs. Stop
+    # and un-enable it here rather than leaving the customer with two
+    # robots' services fighting over one port and no hint why.
+    stopped_previous: str | None = None
+    if previous is not None and previous != body.profile:
+        previous_unit = str(_PROFILE_META[previous]["unit"])
+        if await systemd.is_installed(previous_unit):
+            await systemd.disable_now(previous_unit)
+            stopped_previous = previous_unit
+
+    return {"profile": body.profile, "stopped_previous": stopped_previous}
 
 
 # --------------------------------------------------------------------------
